@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fennec WebRTC check</title>
+    <link rel="icon" href="/dev/assets/fennec-icon.svg" />
+    <link rel="stylesheet" href="/dev/assets/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <img class="logo" src="/dev/assets/fennec.svg" alt="Fennec" />
+      <div class="status-pill">
+        <span id="status-dot" class="dot"></span>
+        <strong id="status">Not connected</strong>
+      </div>
+    </header>
+
+    <div class="layout">
+      <main class="chat">
+        <section id="connect-panel" class="connect-panel">
+          <img class="hero-logo" src="/dev/assets/fennec.svg" alt="Fennec" />
+          <h1>Voice conversation check</h1>
+          <p class="intro">
+            Your microphone goes straight to this Fennec gateway. Local speech models handle
+            hearing and speaking, and the settings on the right apply to your next connection.
+          </p>
+          <button id="connect" disabled>Connect microphone</button>
+          <p id="settings-status" class="settings-status" role="status">Loading server defaults…</p>
+        </section>
+
+        <div id="conversation" class="conversation" aria-live="polite">
+          <p class="empty-conversation">Final transcripts and streamed assistant text appear here.</p>
+        </div>
+
+        <section class="controls">
+          <span class="conversation-state"><span id="conversation-state">Waiting to connect</span></span>
+          <select id="microphone" aria-label="Microphone" disabled>
+            <option value="">System default</option>
+          </select>
+          <button id="mute" class="secondary" disabled>Mute</button>
+          <button id="tone" class="secondary" disabled>Play check tone</button>
+          <button id="resume-audio" class="secondary hidden">Resume received audio</button>
+          <button id="disconnect" class="danger" disabled>Disconnect</button>
+        </section>
+      </main>
+
+      <aside class="sidebar">
+        <details class="panel" open>
+          <summary>Session settings</summary>
+          <div class="panel-body">
+            <p class="settings-note">
+              These choices affect only this browser connection. Server addresses, credentials,
+              and capacity controls stay protected on the server.
+            </p>
+            <button id="reset-settings" class="secondary compact" type="button" disabled>
+              Reset to defaults
+            </button>
+
+            <fieldset id="voice-settings" disabled>
+              <div class="settings-grid">
+                <label class="setting" for="endpoint-silence">
+                  <span>Thinking pause</span>
+                  <small>Wait this long before treating your speech as complete.</small>
+                  <div class="input-with-unit">
+                    <input id="endpoint-silence" type="number" min="300" max="3000" step="100" />
+                    <span>ms</span>
+                  </div>
+                </label>
+
+                <label class="setting" for="vad-threshold">
+                  <span>Speech sensitivity <output id="vad-threshold-value"></output></span>
+                  <small>Lower values notice quieter speech but may hear more background noise.</small>
+                  <input id="vad-threshold" type="range" min="0.1" max="0.9" step="0.05" />
+                </label>
+
+                <label class="setting" for="min-speech">
+                  <span>Shortest speech</span>
+                  <small>Ignore sounds shorter than this duration.</small>
+                  <div class="input-with-unit">
+                    <input id="min-speech" type="number" min="80" max="1000" step="20" />
+                    <span>ms</span>
+                  </div>
+                </label>
+
+                <label class="setting" for="prefix-audio">
+                  <span>Speech safety buffer</span>
+                  <small>Keep audio from just before speech starts to avoid clipped first words.</small>
+                  <div class="input-with-unit">
+                    <input id="prefix-audio" type="number" min="100" max="1000" step="20" />
+                    <span>ms</span>
+                  </div>
+                </label>
+
+                <label class="setting" for="max-turn">
+                  <span>Longest turn</span>
+                  <small>Finish unusually long speech automatically after this limit.</small>
+                  <div class="input-with-unit">
+                    <input id="max-turn" type="number" min="5" max="120" step="1" />
+                    <span>sec</span>
+                  </div>
+                </label>
+
+                <label class="setting" for="speech-language">
+                  <span>Language</span>
+                  <small>Language code used by speech recognition, such as en or en-IN.</small>
+                  <input id="speech-language" type="text" maxlength="32" autocomplete="off" required />
+                </label>
+              </div>
+
+              <div class="toggle-grid" aria-label="Microphone processing">
+                <label class="toggle"><input id="echo-cancellation" type="checkbox" /> Echo cancellation</label>
+                <label class="toggle"><input id="noise-suppression" type="checkbox" /> Noise suppression</label>
+                <label class="toggle"><input id="auto-gain" type="checkbox" /> Automatic volume</label>
+              </div>
+
+              <details class="advanced-settings">
+                <summary>Speech models and voice</summary>
+                <div class="settings-grid advanced-grid">
+                  <label class="setting" for="stt-model">
+                    <span>Speech-to-text model</span>
+                    <input id="stt-model" type="text" maxlength="256" autocomplete="off" required />
+                  </label>
+                  <label class="setting" for="tts-model">
+                    <span>Text-to-speech model</span>
+                    <input id="tts-model" type="text" maxlength="256" autocomplete="off" required />
+                  </label>
+                  <label class="setting" for="tts-voice">
+                    <span>Voice</span>
+                    <input id="tts-voice" type="text" maxlength="128" autocomplete="off" required />
+                  </label>
+                </div>
+              </details>
+            </fieldset>
+          </div>
+        </details>
+
+        <details class="panel">
+          <summary>Logs</summary>
+          <div class="panel-body">
+            <ol id="events" aria-label="Recent events"></ol>
+          </div>
+        </details>
+
+        <details class="panel">
+          <summary>Audio diagnostics</summary>
+          <div class="panel-body">
+            <pre id="diagnostics">Connect to inspect the browser-selected microphone settings.</pre>
+          </div>
+        </details>
+      </aside>
+    </div>
+
+    <audio id="remote-audio" autoplay></audio>
+    <script type="module" src="/dev/assets/app.js"></script>
+  </body>
+</html>

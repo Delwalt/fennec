@@ -1,0 +1,27 @@
+[project]
+name = "fennec-gateway"
+version = "0.1.0"
+description = "Direct WebRTC gateway for the local-first Fennec voice service"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+  "aiortc==1.15.0",
+  "fastapi==0.141.1",
+  "faster-whisper==1.2.1",
+  "httpx==0.28.1",
+  "pyjwt==2.13.0",
+  "uvicorn==0.52.3",
+]
+
+[dependency-groups]
+dev = [
+  "pytest==8.4.2",
+  "pytest-asyncio==1.1.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

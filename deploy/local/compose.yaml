@@ -1,0 +1,119 @@
+name: fennec-local
+
+services:
+  gateway:
+    image: fennec-gateway:local
+    build:
+      context: ../../services/gateway
+      dockerfile: Dockerfile
+    network_mode: host
+    environment:
+      FENNEC_SERVICE_TOKEN: ${FENNEC_SERVICE_TOKEN:?set FENNEC_SERVICE_TOKEN in deploy/local/.env}
+      FENNEC_SESSION_SECRET: ${FENNEC_SESSION_SECRET:?set FENNEC_SESSION_SECRET in deploy/local/.env}
+      FENNEC_PUBLIC_BASE_URL: ${FENNEC_PUBLIC_BASE_URL:-http://127.0.0.1:8080}
+      FENNEC_SESSION_TTL_SECONDS: ${FENNEC_SESSION_TTL_SECONDS:-120}
+      FENNEC_MAX_SESSIONS: ${FENNEC_MAX_SESSIONS:-64}
+      FENNEC_DEV_MODE: ${FENNEC_DEV_MODE:-false}
+      FENNEC_CONVERSATION_ENABLED: ${FENNEC_CONVERSATION_ENABLED:-true}
+      FENNEC_SPEECH_BASE_URL: ${FENNEC_SPEECH_BASE_URL:-http://127.0.0.1:8000/v1}
+      FENNEC_STT_MODEL: ${FENNEC_STT_MODEL:-Systran/faster-distil-whisper-small.en}
+      FENNEC_TTS_MODEL: ${FENNEC_TTS_MODEL:-speaches-ai/Kokoro-82M-v1.0-ONNX}
+      FENNEC_TTS_VOICE: ${FENNEC_TTS_VOICE:-af_heart}
+      FENNEC_SPEECH_LANGUAGE: ${FENNEC_SPEECH_LANGUAGE:-en}
+      FENNEC_CONSUMER_URL: ${FENNEC_CONSUMER_URL:-http://127.0.0.1:8090/v1/turns}
+      FENNEC_CONSUMER_HEALTH_URL: ${FENNEC_CONSUMER_HEALTH_URL:-}
+      FENNEC_CONSUMER_TOKEN: ${FENNEC_CONSUMER_TOKEN:?set FENNEC_CONSUMER_TOKEN in deploy/local/.env}
+      FENNEC_PROVIDER_TIMEOUT_SECONDS: ${FENNEC_PROVIDER_TIMEOUT_SECONDS:-120}
+      FENNEC_VAD_THRESHOLD: ${FENNEC_VAD_THRESHOLD:-0.6}
+      FENNEC_ENDPOINT_SILENCE_MS: ${FENNEC_ENDPOINT_SILENCE_MS:-1200}
+      FENNEC_PREFIX_MS: ${FENNEC_PREFIX_MS:-320}
+      FENNEC_MIN_SPEECH_MS: ${FENNEC_MIN_SPEECH_MS:-250}
+      FENNEC_MAX_TURN_SECONDS: ${FENNEC_MAX_TURN_SECONDS:-30}
+      FENNEC_TURN_URL: ${FENNEC_TURN_URL:-}
+      FENNEC_TURN_PUBLIC_URL: ${FENNEC_TURN_PUBLIC_URL:-}
+      FENNEC_TURN_SHARED_SECRET: ${FENNEC_TURN_SHARED_SECRET:-}
+      FENNEC_TURN_CREDENTIAL_TTL_SECONDS: ${FENNEC_TURN_CREDENTIAL_TTL_SECONDS:-300}
+    depends_on:
+      speech:
+        condition: service_healthy
+      mock-consumer:
+        condition: service_healthy
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2)
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  speech:
+    image: ghcr.io/speaches-ai/speaches:0.8.3-cpu@sha256:21e3df06d842fb7802ab470dd77c25f0e8c0d22950e8d8c6ae886e851af53ef8
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      WHISPER__INFERENCE_DEVICE: cpu
+      WHISPER__COMPUTE_TYPE: int8
+      STT_MODEL_TTL: "-1"
+      TTS_MODEL_TTL: "-1"
+    volumes:
+      - speech-models:/home/ubuntu/.cache/huggingface/hub
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  mock-consumer:
+    image: fennec-mock-consumer:local
+    build:
+      context: ../../examples/mock-consumer
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      FENNEC_CONSUMER_TOKEN: ${FENNEC_CONSUMER_TOKEN:?set FENNEC_CONSUMER_TOKEN in deploy/local/.env}
+      FENNEC_MOCK_STREAM_DELAY_MS: ${FENNEC_MOCK_STREAM_DELAY_MS:-1200}
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+    stop_grace_period: 5s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2)
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 2s
+
+volumes:
+  speech-models:
+    # Stable across Compose project names so downloaded weights survive upgrades.
+    name: fennec-speech-models

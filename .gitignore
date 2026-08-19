@@ -1,0 +1,13 @@
+node_modules/
+dist/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store
+
+deploy/local/.env
+services/gateway/.venv/
+services/gateway/.pytest_cache/
+.pytest_cache/
+**/__pycache__/
+*.pyc

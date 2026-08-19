@@ -1,0 +1,19 @@
+{
+  "name": "fennec",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.17.0",
+  "scripts": {
+    "check": "pnpm typecheck && pnpm test",
+    "typecheck": "pnpm --recursive typecheck",
+    "test": "pnpm --recursive --if-present test && pnpm test:gateway",
+    "test:gateway": "uv run --project services/gateway --directory services/gateway --locked python -m pytest",
+    "stack:up": "docker compose --env-file deploy/local/.env -f deploy/local/compose.yaml up --build --detach",
+    "stack:down": "docker compose --env-file deploy/local/.env -f deploy/local/compose.yaml down",
+    "stack:logs": "docker compose --env-file deploy/local/.env -f deploy/local/compose.yaml logs -f gateway",
+    "smoke:conversation": "docker compose --env-file deploy/local/.env -f deploy/local/compose.yaml exec -T gateway python -m fennec_gateway.smoke",
+    "smoke:pause": "docker compose --env-file deploy/local/.env -f deploy/local/compose.yaml exec -T gateway python -m fennec_gateway.smoke --pause",
+    "smoke:interruption": "docker compose --env-file deploy/local/.env -f deploy/local/compose.yaml exec -T gateway python -m fennec_gateway.smoke --barge-in"
+  }
+}
