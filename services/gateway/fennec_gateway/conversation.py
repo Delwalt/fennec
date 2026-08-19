@@ -19,6 +19,8 @@ from .turns import SileroTurnDetector
 
 logger = logging.getLogger("fennec.gateway")
 EventSink = Callable[[str, dict[str, Any]], None]
+WARM_RETRY_SECONDS = 5
+MAX_WARM_RETRY_SECONDS = 60
 
 
 class AudioBackpressureError(RuntimeError):
@@ -408,7 +410,7 @@ class ConversationRuntime:
         if self._ready:
             return "ready"
         if self._error:
-            return "failed"
+            return "retrying"
         return "warming"
 
     def start(self) -> None:
@@ -468,43 +470,62 @@ class ConversationRuntime:
         await asyncio.gather(self.speech.close(), self.consumer.close(), return_exceptions=True)
 
     async def _warm(self) -> None:
-        try:
-            await self.consumer.health()
-            if self._default_configuration is None:
-                await self.speech.ensure_models()
-            else:
-                await self.prepare_configuration(self._default_configuration)
-            await asyncio.to_thread(SileroTurnDetector.warm)
-            if self._default_configuration is None:
-                wav = await self.speech.synthesize("Fennec is ready.")
-            else:
-                wav = await self.speech.synthesize(
-                    "Fennec is ready.",
-                    model=self._default_configuration.tts_model,
-                    voice=self._default_configuration.tts_voice,
+        delay = WARM_RETRY_SECONDS
+        while True:
+            try:
+                await self._warm_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._error = type(error).__name__
+                logger.warning(
+                    "conversation warm-up failed (%s); retrying in %ds",
+                    error,
+                    delay,
                 )
-            pcm16 = await asyncio.to_thread(
-                decode_audio_to_pcm16_mono,
-                wav,
-                sample_rate=16_000,
-            )
-            if self._default_configuration is None:
-                transcript = await self.speech.transcribe(pcm16)
-            else:
-                transcript = await self.speech.transcribe(
-                    pcm16,
-                    model=self._default_configuration.stt_model,
-                    language=self._default_configuration.speech_language,
-                )
-            if not transcript:
-                raise ProviderError("local speech warm-up returned an empty transcript")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, MAX_WARM_RETRY_SECONDS)
+                continue
+            self._error = None
             self._ready = True
             logger.info("conversation services ready")
-        except asyncio.CancelledError:
-            raise
+            return
+
+    async def _warm_once(self) -> None:
+        # The consumer is someone else's service and restarts on its own schedule.
+        # Its absence must not stop Fennec becoming ready; turns fail loudly instead.
+        try:
+            await self.consumer.health()
         except Exception as error:
-            self._error = type(error).__name__
-            logger.exception("conversation services failed to warm")
+            logger.warning("consumer is unreachable; turns will fail until it returns: %s", error)
+        if self._default_configuration is None:
+            await self.speech.ensure_models()
+        else:
+            await self.prepare_configuration(self._default_configuration)
+        await asyncio.to_thread(SileroTurnDetector.warm)
+        if self._default_configuration is None:
+            wav = await self.speech.synthesize("Fennec is ready.")
+        else:
+            wav = await self.speech.synthesize(
+                "Fennec is ready.",
+                model=self._default_configuration.tts_model,
+                voice=self._default_configuration.tts_voice,
+            )
+        pcm16 = await asyncio.to_thread(
+            decode_audio_to_pcm16_mono,
+            wav,
+            sample_rate=16_000,
+        )
+        if self._default_configuration is None:
+            transcript = await self.speech.transcribe(pcm16)
+        else:
+            transcript = await self.speech.transcribe(
+                pcm16,
+                model=self._default_configuration.stt_model,
+                language=self._default_configuration.speech_language,
+            )
+        if not transcript:
+            raise ProviderError("local speech warm-up returned an empty transcript")
 
 
 async def response_phrases(

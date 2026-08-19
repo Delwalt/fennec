@@ -6,6 +6,7 @@ from aiortc import MediaStreamTrack, RTCDataChannel, RTCPeerConnection, RTCSessi
 from av import AudioFrame
 import pytest
 
+from conftest import wait_until
 from fennec_gateway.media import AssistantAudioTrack
 from fennec_gateway.session import SessionCapacityError, SessionRegistry, VoiceSession
 
@@ -26,12 +27,6 @@ class SilenceTrack(MediaStreamTrack):
         frame.time_base = Fraction(1, 48_000)
         self._pts += 960
         return frame
-
-
-async def wait_until(predicate, *, timeout: float = 5.0) -> None:
-    async with asyncio.timeout(timeout):
-        while not predicate():
-            await asyncio.sleep(0.01)
 
 
 async def test_direct_peer_exchanges_microphone_audio_assistant_audio_and_control() -> None:

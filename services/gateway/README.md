@@ -17,8 +17,25 @@ It provides:
 - generation-aware cancellation and stale-audio rejection;
 - confirmed-speech barge-in that aborts the active consumer and TTS work;
 - bounded, text-free session latency and queue telemetry;
-- liveness and model/consumer readiness endpoints; and
+- liveness and speech-model readiness endpoints; and
 - a development-only browser harness.
+
+## Readiness
+
+`/health/live` answers whether the process is up. `/health/ready` answers
+whether a conversation can happen, and reports one of three states:
+
+| `status` | Meaning |
+| --- | --- |
+| `warming` | loading speech models; no sessions yet |
+| `retrying` | a dependency was unreachable; retrying with backoff |
+| `ready` | sessions accepted |
+
+Readiness depends only on Fennec's own speech models, never on the consumer. An
+unreachable consumer is logged at startup and fails individual turns; it does not
+stop sessions being created, because the consumer is a separate application that
+restarts on its own schedule. Warm-up retries until it succeeds, so a dependency
+that is slow or briefly down at boot recovers without a restart.
 
 ## Run through Docker
 

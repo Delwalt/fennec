@@ -26,4 +26,4 @@ EXPOSE 8080/tcp
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=2)"]
 ENTRYPOINT ["uvicorn", "fennec_gateway.app:app"]
-CMD ["--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
+CMD ["--host", "0.0.0.0", "--port", "8080"]

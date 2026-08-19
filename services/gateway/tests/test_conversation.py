@@ -1,11 +1,14 @@
 import asyncio
 from collections.abc import AsyncIterator
 from io import BytesIO
+from unittest.mock import patch
 import wave
 
-from fennec_gateway.conversation import ConversationSession, response_phrases
+from conftest import wait_until
+from fennec_gateway import conversation
+from fennec_gateway.conversation import ConversationRuntime, ConversationSession, response_phrases
 from fennec_gateway.media import AssistantAudioTrack
-from fennec_gateway.providers import FinalizedTurn
+from fennec_gateway.providers import FinalizedTurn, ProviderError
 from fennec_gateway.session_configuration import VoiceConfiguration
 from fennec_gateway.turns import TurnDetection
 
@@ -365,3 +368,64 @@ async def test_empty_turn_after_interruption_is_counted_as_a_possible_false_inte
     summaries = [data for event, data in events if event == "telemetry.session.summary"]
     assert summaries[0]["possible_false_interruptions"] == 1
     assert summaries[0]["empty_transcripts"] == 1
+
+
+class UnreachableConsumer(FakeConsumer):
+    async def health(self) -> None:
+        raise ProviderError("consumer service is unavailable")
+
+
+class BrokenThenWorkingSpeech(FakeSpeech):
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.remaining_failures = failures
+
+    async def ensure_models(self, **_: object) -> None:
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise ProviderError("speech service is unavailable")
+
+
+async def test_a_dead_consumer_at_boot_still_lets_the_gateway_become_ready() -> None:
+    # Regression: the consumer is a third-party service. When it was unreachable at
+    # boot the gateway used to stay un-ready forever and refuse every session with 503.
+    runtime = ConversationRuntime(speech=FakeSpeech(), consumer=UnreachableConsumer())
+    with patch.object(conversation.SileroTurnDetector, "warm"):
+        runtime.start()
+        await wait_until(lambda: runtime.ready)
+
+    assert runtime.status == "ready"
+    await runtime.close()
+
+
+async def test_warm_up_retries_until_its_own_speech_dependency_returns() -> None:
+    # Regression: a single warm-up failure used to be terminal, so a gateway that
+    # started before its speech models were reachable never recovered on its own.
+    speech = BrokenThenWorkingSpeech(failures=2)
+    runtime = ConversationRuntime(speech=speech, consumer=FakeConsumer())
+    with patch.object(conversation, "WARM_RETRY_SECONDS", 0), \
+            patch.object(conversation, "MAX_WARM_RETRY_SECONDS", 0), \
+            patch.object(conversation.SileroTurnDetector, "warm"):
+        runtime.start()
+        await wait_until(lambda: runtime.ready)
+
+    assert speech.remaining_failures == 0
+    await runtime.close()
+
+
+async def test_persistent_speech_failure_keeps_retrying_instead_of_giving_up() -> None:
+    # A gateway that cannot reach its own speech models must report that it is still
+    # trying, not settle into a terminal state that only a manual restart clears.
+    speech = BrokenThenWorkingSpeech(failures=1_000)
+    runtime = ConversationRuntime(speech=speech, consumer=FakeConsumer())
+    with patch.object(conversation, "WARM_RETRY_SECONDS", 0), \
+            patch.object(conversation, "MAX_WARM_RETRY_SECONDS", 0), \
+            patch.object(conversation.SileroTurnDetector, "warm"):
+        runtime.start()
+        await wait_until(lambda: speech.remaining_failures < 998)
+        attempted = 1_000 - speech.remaining_failures
+        assert runtime.status == "retrying"
+        assert not runtime.ready
+        await wait_until(lambda: speech.remaining_failures < attempted)
+
+    await runtime.close()
