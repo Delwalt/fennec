@@ -5,6 +5,7 @@
   color: #ededed;
   --line: #1f1f1f;
   --muted: #8f8f8f;
+  --live: #3ddc97;
 }
 
 * { box-sizing: border-box; }
@@ -39,7 +40,7 @@ body {
   font-size: 0.9rem;
 }
 .dot { width: 0.6rem; height: 0.6rem; border-radius: 999px; background: #6b6b6b; }
-.dot.connected { background: #ededed; box-shadow: 0 0 0 0.3rem rgba(255, 255, 255, 0.14); }
+.dot.connected { background: var(--live); box-shadow: 0 0 0 0.3rem rgba(61, 220, 151, 0.14); }
 .dot.failed { background: #ff6f78; }
 
 .layout {
@@ -93,7 +94,13 @@ body:not(.live) .controls { display: none; }
   border-top: 1px solid var(--line);
   background: #0a0a0a;
 }
-.conversation-state { margin-right: auto; color: var(--muted); font-size: 0.9rem; }
+.conversation-state { display: flex; align-items: center; gap: 0.5rem; margin-right: auto; color: var(--muted); font-size: 0.9rem; }
+.conversation-state::before { content: ""; width: 0.55rem; height: 0.55rem; border-radius: 999px; background: #6b6b6b; }
+.conversation-state[data-state="listening"]::before,
+.conversation-state[data-state="transcribing"]::before,
+.conversation-state[data-state="waiting"]::before,
+.conversation-state[data-state="speaking"]::before { background: var(--live); }
+.conversation-state[data-state="error"]::before { background: #ff6f78; }
 .controls select { width: auto; max-width: 14rem; margin: 0; }
 
 /* Sidebar */

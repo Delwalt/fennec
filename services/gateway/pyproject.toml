@@ -3,6 +3,7 @@ name = "fennec-gateway"
 version = "0.1.0"
 description = "Direct WebRTC gateway for the local-first Fennec voice service"
 requires-python = ">=3.13,<3.14"
+license = "MIT"
 dependencies = [
   "aiortc==1.15.0",
   "fastapi==0.141.1",

@@ -1,71 +1,86 @@
 <img src="fennec.svg" alt="Fennec" width="360">
 
-Fennec gives a web app a realtime voice interface. Speech in, final text out;
-streamed text in, speech out. Your app stays the brain — Fennec is its ears and
-mouth.
+I got tired of paying per minute to give an app a voice. I had a homeserver
+sitting there doing nothing, so I wondered how far I could get with local models
+only. This is where I landed.
 
-Everything runs locally: Whisper for transcription, Kokoro for speech, Silero
-for turn detection, direct WebRTC for transport. No cloud voice platform, no
-per-minute bill.
+Fennec is the ears and mouth for a web app. Speech goes in, you get final text
+out. You stream text back, it comes out as speech. Your app stays the brain —
+Fennec never touches your LLM, your prompts, or your data.
+
+It runs entirely on your own machine. Whisper listens, Kokoro speaks, Silero
+works out when you've actually finished talking, and WebRTC carries the audio.
+Nothing leaves the box, and nothing bills you by the minute.
+
+It works well enough that I use it. It is not a finished product — see
+[what's rough](#whats-rough) at the bottom. Take it, break it, make it yours.
 
 ## Run it
 
-Needs Docker with host networking on (Docker Desktop: *Settings → Resources →
-Network → Enable host networking*).
+You need Docker with host networking on. On Docker Desktop that's
+*Settings → Resources → Network → Enable host networking* — WebRTC grabs
+dynamic UDP ports and won't work without it.
 
 ```sh
 cp deploy/local/.env.example deploy/local/.env
 pnpm stack:up
 ```
 
-First run pulls the speech models, which takes a few minutes. `pnpm stack:down`
-stops it; the weights stay cached.
+First run pulls the speech models, which takes a few minutes and is the only
+slow part. They're cached after that. `pnpm stack:down` when you're done.
 
-## Test it
+## Play with it
 
-Open **<http://127.0.0.1:8080/dev>**, connect your microphone, and talk. You get
-live transcripts, the assistant's streamed reply spoken back, and a settings
-panel to tune the conversation. It replies through a mock backend — that is the
-part you swap for your app.
+Open **<http://127.0.0.1:8080/dev>**, connect your mic, and start talking.
 
-No microphone handy? These run the full loop synthetically:
+You'll see your words appear as you speak, and hear a reply come back. There's
+a settings panel to change voices and tune how long it waits before deciding
+you've finished a sentence — that setting matters more than you'd expect, so
+it's worth fiddling with.
+
+Out of the box it replies through a dumb mock backend that just echoes. That's
+the bit you replace with your actual app.
+
+No mic handy? These run the whole loop without one:
 
 ```sh
-pnpm smoke:conversation   # speak -> transcribe -> respond -> speak back
-pnpm smoke:pause          # a thinking pause stays one turn
-pnpm smoke:interruption   # barge-in cancels in under 200 ms
+pnpm smoke:conversation   # speak -> transcribe -> reply -> speak back
+pnpm smoke:pause          # pausing mid-thought doesn't cut you off
+pnpm smoke:interruption   # talking over it shuts it up fast
 ```
 
-## Change the models
+## Swap the models
 
-Edit `deploy/local/.env` and restart with `pnpm stack:up`:
+Edit `deploy/local/.env`, run `pnpm stack:up` again:
 
 ```sh
-FENNEC_STT_MODEL=Systran/faster-distil-whisper-small.en   # larger = more accurate, slower
+FENNEC_STT_MODEL=Systran/faster-distil-whisper-small.en   # bigger = better, slower
 FENNEC_TTS_MODEL=speaches-ai/Kokoro-82M-v1.0-ONNX
 FENNEC_TTS_VOICE=af_heart                                 # af_sky, am_adam, bf_emma, …
 FENNEC_SPEECH_LANGUAGE=en
 ```
 
-Kokoro ships 54 voices across English, Japanese, Chinese, French, Hindi,
-Italian, Portuguese, and Spanish. List them from the running stack:
+Kokoro has 54 voices across English, Japanese, Chinese, French, Hindi, Italian,
+Portuguese, and Spanish. To see them all while the stack is up:
 
 ```sh
 curl -s http://127.0.0.1:8000/v1/models | jq '.data[] | select(.task=="text-to-speech").voices[].id'
 ```
 
-Any Whisper or Kokoro model that [Speaches](https://speaches.ai) serves works.
-The `/dev` settings panel changes the same values per session, so try them there
-before committing to one.
+Anything [Speaches](https://speaches.ai) can serve will work. The `/dev`
+settings panel changes the same things per session, so try there first before
+you commit to one.
 
-Turn detection is tunable the same way — `FENNEC_ENDPOINT_SILENCE_MS` (default
-`1200`) is the one to reach for if replies feel too eager or too slow. See
-[services/gateway/README.md](services/gateway/README.md) for the full list and
-valid ranges.
+If replies feel too eager or too slow, `FENNEC_ENDPOINT_SILENCE_MS` (default
+`1200`) is the dial you want. [services/gateway/README.md](services/gateway/README.md)
+has the rest.
 
-## Integrate it
+## Wire it into your app
 
-**Backend** — mint browser sessions and answer voice turns:
+Two halves. Your backend answers questions, your frontend shows the
+conversation.
+
+**Backend** — hand out sessions, answer turns:
 
 ```ts
 import { createFennecConsumer } from '@fennec/consumer';
@@ -75,20 +90,20 @@ const fennec = createFennecConsumer({
   serviceCredential: process.env.FENNEC_SERVICE_TOKEN!,
   consumerToken: process.env.FENNEC_CONSUMER_TOKEN!,
   respond: async function* (turn, signal) {
-    yield* myAgent.respond(turn.text, signal);   // yield phrases as they're ready
+    yield* myAgent.respond(turn.text, signal);   // yield phrases, don't wait for the full answer
   },
 });
 
 app.post('/api/voice/session', requireLogin, async (c) =>
-  c.json(await fennec.createClientSession()));   // safe to send to the browser
+  c.json(await fennec.createClientSession()));   // safe to hand to the browser
 
-app.post('/internal/fennec/turns', fennec.turnHandler());  // called by the gateway
+app.post('/internal/fennec/turns', fennec.turnHandler());  // the gateway calls this
 ```
 
-Point `FENNEC_CONSUMER_URL` in your `.env` at that second route and drop the
+Then point `FENNEC_CONSUMER_URL` at that second route and delete the
 `mock-consumer` service from the compose file.
 
-**Browser** — Fennec ships no UI, just observable state:
+**Frontend** — there's no UI in here, just state you render however you like:
 
 ```ts
 import { createFennecClient } from '@fennec/client';
@@ -105,46 +120,63 @@ await client.connect();
 await client.startMicrophone();
 ```
 
-State gives you `connectionState`, `voiceState` (`listening` / `thinking` /
-`speaking`), `transcripts`, audio levels, and `error`. Methods cover `mute`,
-`stopMicrophone`, `listMicrophones`, `selectMicrophone`, `enableAudioPlayback`,
-`disconnect`, and `destroy`. The `/dev` page is a complete working UI over this
-same API if you want code to copy.
+You get `connectionState`, `voiceState` (`listening` / `thinking` / `speaking`),
+`transcripts`, audio levels, and `error`. Plus `mute`, `stopMicrophone`,
+`listMicrophones`, `selectMicrophone`, `enableAudioPlayback`, `disconnect`, and
+`destroy`. The `/dev` page is a full working UI built on exactly this — steal
+from it.
 
-The packages aren't on npm — add your app to this pnpm workspace and depend on
-them with `"workspace:*"`.
+Nothing's published to npm. Drop your app into this pnpm workspace and use
+`"workspace:*"`.
 
-## How it works
+## How it actually works
 
 ```text
-browser mic ──WebRTC──> gateway ──> Silero VAD ──> Whisper ──> final transcript
-                           │                                         │
-browser speaker <──WebRTC──┴── Kokoro <── streamed text <──── your backend
+your mic ──WebRTC──> gateway ──> Silero ──> Whisper ──> text
+                        │                                │
+your speakers <─WebRTC──┴── Kokoro <── streamed text <── your backend
 ```
 
-Silero watches the audio and decides when you've actually finished a sentence
-rather than just paused. Whisper transcribes that turn, the gateway POSTs it to
-your backend, and your streamed reply is cut into phrases and synthesised as it
-arrives — so speech starts before your answer is finished.
+Silero watches the audio and decides whether you've finished a sentence or just
+paused to think. That distinction is most of what makes a voice app feel human
+or infuriating. Whisper transcribes the turn, the gateway POSTs it to your
+backend, and your reply gets chopped into phrases and spoken as it streams in —
+so it starts talking before your answer is done.
 
-Every response carries a generation id. Start talking over the assistant and
-Fennec stops playback, aborts the HTTP request to your backend, and throws away
-any audio still in flight from the cancelled generation. That's what makes
-interrupting feel like interrupting a person.
+Every reply carries a generation id. Talk over it and Fennec stops playback,
+kills the HTTP request to your backend, and bins any audio still in flight from
+the reply it just cancelled. That last part is what makes interrupting feel like
+interrupting a person instead of waiting for a robot to finish.
 
-Credentials never reach the browser: your backend authenticates to the gateway
-with `FENNEC_SERVICE_TOKEN`, the gateway authenticates back with
-`FENNEC_CONSUMER_TOKEN`, and the browser only ever gets a two-minute,
-single-session token. Audio is never stored, and session telemetry carries no
-transcript text.
+Credentials never reach the browser. Your backend talks to the gateway with one
+token, the gateway talks back with another, and the browser only ever gets a
+two-minute token good for a single session. No audio is stored anywhere.
 
-**Layout** — `services/gateway/` is the gateway and the `/dev` UI,
+**Where things live** — `services/gateway/` is the gateway and the `/dev` UI,
 `deploy/local/` the Docker stack, `packages/client/` the browser SDK,
-`packages/consumer/` the backend SDK, `examples/mock-consumer/` the stand-in
-backend.
+`packages/consumer/` the backend SDK, `examples/mock-consumer/` the fake backend.
 
-**Limits** — one client per session, English by default, no reconnect recovery
-(a dropped connection means a new session), no provider fallback or telephony.
+**Poking at it** — `pnpm install`, then `pnpm check` runs typechecks and all
+three test suites.
 
-**Development** — `pnpm install`, then `pnpm check` for typecheck and the client,
-consumer, and gateway test suites.
+## What's rough
+
+- One client per session. It's not built for many people at once.
+- English by default. Other languages are configured, not tested.
+- If the connection drops you start a new session. No reconnect.
+- Turn detection defaults come from my own voice and my own room. Yours will
+  probably want different numbers.
+
+## The name
+
+Fennec — isn't that a cool name? 🦊 A fennec fox has ears bigger than its head,
+which is a fitting accident for something whose entire job is listening.
+
+The logo is AI-generated. I described roughly what I wanted and it drew it. I'm
+still not over what these tools can do for us now.
+
+## License
+
+[MIT](LICENSE) — do whatever you like. The speech models are downloaded at
+runtime and have their own terms: Whisper and Silero are MIT, Kokoro-82M is
+Apache 2.0. Worth a look yourself if money is involved.

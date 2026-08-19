@@ -44,6 +44,11 @@ function record(message) {
   while (elements.events.children.length > 8) elements.events.lastElementChild.remove();
 }
 
+function setConversationState(label, state = label) {
+  elements.conversationState.textContent = label;
+  elements.conversationState.dataset.state = state;
+}
+
 function setStatus(label, state = "") {
   elements.status.textContent = label;
   elements.statusDot.className = `dot ${state}`;
@@ -139,7 +144,7 @@ function addMessage(role, text, generationId = "") {
 
 function handleControlMessage(message) {
   if (message.type === "state.changed") {
-    elements.conversationState.textContent = message.state;
+    setConversationState(message.state);
   } else if (message.type === "transcript.final") {
     addMessage("user", message.text);
   } else if (message.type === "assistant.text.delta") {
@@ -148,11 +153,11 @@ function handleControlMessage(message) {
     void playRemoteAudio();
   } else if (message.type === "assistant.cancelled") {
     elements.remoteAudio.pause();
-    elements.conversationState.textContent = "interrupted";
+    setConversationState("interrupted", "idle");
     const cancelled = assistantMessages.get(message.generation_id);
     if (cancelled) cancelled.dataset.interrupted = "true";
   } else if (message.type === "error") {
-    elements.conversationState.textContent = `error · ${message.component || message.code}`;
+    setConversationState(`error · ${message.component || message.code}`, "error");
   }
   record(`Fennec: ${message.type}`);
 }
@@ -303,7 +308,7 @@ async function disconnect(updateStatus = true) {
   session = null;
   elements.mute.textContent = "Mute";
   elements.resumeAudio.classList.add("hidden");
-  elements.conversationState.textContent = "Waiting to connect";
+  setConversationState("Waiting to connect", "idle");
   setConnected(false);
   elements.connect.disabled = false;
   if (updateStatus) setStatus("Disconnected");
