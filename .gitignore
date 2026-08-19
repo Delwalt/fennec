@@ -6,6 +6,7 @@ coverage/
 .DS_Store
 
 deploy/local/.env
+deploy/workbench/
 services/gateway/.venv/
 services/gateway/.pytest_cache/
 .pytest_cache/
