@@ -1,10 +1,14 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   createWebRTCTransport,
   toFennecConnection,
 } from '../src/transports/webrtc-transport.ts';
 
 describe('direct WebRTC transport', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('maps a safe client session to the generic connection contract', () => {
     expect(toFennecConnection({
       sessionId: 'session-1',
@@ -53,6 +57,32 @@ describe('direct WebRTC transport', () => {
       expiresAt: '2026-08-17T16:00:00Z',
       iceServers: [{ urls: 'turn:relay:3478', username: 'u', credential: 'c' }],
     }).iceServers).toEqual([{ urls: 'turn:relay:3478', username: 'u', credential: 'c' }]);
+  });
+
+  it('offers what it has rather than waiting on gathering forever', async () => {
+    // Gathering completes only once every candidate resolves, and a TURN allocation the
+    // network silently drops never does. Unbounded, that leaves a caller connecting with
+    // no error and no end — which is a two-minute spinner, not a failure anyone can see.
+    vi.useFakeTimers();
+    const peer = new FakePeerConnection();
+    peer.iceGatheringState = 'gathering';
+    const fetch = vi.fn(async () => Response.json({ type: 'answer', sdp: 'answer-sdp' }));
+    const transport = createWebRTCTransport({
+      fetch,
+      createPeerConnection: () => peer as unknown as RTCPeerConnection,
+    });
+
+    const connecting = transport.connect({
+      connectionUrl: 'https://fennec.test/offer',
+      accessToken: 'voice-token',
+    });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(fetch).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_500);
+    await connecting;
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(peer.remoteDescription).toEqual({ type: 'answer', sdp: 'answer-sdp' });
   });
 
   it('calls fetch without making it a method of the transport', async () => {

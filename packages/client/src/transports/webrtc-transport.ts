@@ -362,14 +362,26 @@ class WebRTCTransport implements VoiceTransport {
   }
 }
 
+/** Long enough for a relay allocation on a healthy network, short enough that a stalled
+ *  one is not mistaken for progress. */
+const ICE_GATHERING_TIMEOUT_MS = 5_000;
+
+/** Waits for the candidates, but never forever. Gathering only completes when every
+ *  candidate has resolved or timed out, and configuring a TURN server adds an allocation
+ *  that can hang — on a network that silently drops it, an unbounded wait leaves the
+ *  caller connecting with no error and no end. Whatever was gathered is offered instead. */
 function waitForIceGathering(peer: RTCPeerConnection): Promise<void> {
   if (peer.iceGatheringState === 'complete') return Promise.resolve();
   return new Promise((resolve) => {
-    const listener = () => {
-      if (peer.iceGatheringState !== 'complete') return;
+    const done = () => {
+      clearTimeout(timer);
       peer.removeEventListener('icegatheringstatechange', listener);
       resolve();
     };
+    const listener = () => {
+      if (peer.iceGatheringState === 'complete') done();
+    };
+    const timer = setTimeout(done, ICE_GATHERING_TIMEOUT_MS);
     peer.addEventListener('icegatheringstatechange', listener);
   });
 }
