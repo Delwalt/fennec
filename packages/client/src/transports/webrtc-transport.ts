@@ -14,6 +14,7 @@ export type FennecClientSession = {
   signalingUrl: string;
   accessToken: string;
   expiresAt: string;
+  candidatesUrl?: string;
   iceServers?: FennecIceServer[];
 };
 
@@ -34,6 +35,7 @@ export type FennecMicrophoneProcessing = {
 export function toFennecConnection(session: FennecClientSession): FennecConnection {
   return {
     connectionUrl: session.signalingUrl,
+    candidatesUrl: session.candidatesUrl,
     accessToken: session.accessToken,
     iceServers: session.iceServers ?? [],
   };
@@ -88,6 +90,31 @@ class WebRTCTransport implements VoiceTransport {
     };
   }
 
+  /** Posts each candidate as the browser finds it. Failures are deliberately swallowed:
+   *  a candidate that does not arrive costs one path, while throwing here would abort a
+   *  connection the remaining candidates may well complete. */
+  private trickle(peer: RTCPeerConnection, connection: FennecConnection): void {
+    const url = connection.candidatesUrl;
+    if (!url) return;
+    peer.addEventListener('icecandidate', (event) => {
+      const candidate = event.candidate;
+      // A null candidate is the end-of-gathering marker, not something to send.
+      if (!candidate?.candidate) return;
+      void this.fetch(url, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${connection.accessToken}`,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid,
+          sdpMLineIndex: candidate.sdpMLineIndex,
+        }),
+      }).catch(() => undefined);
+    });
+  }
+
   async connect(connection: FennecConnection): Promise<void> {
     this.assertActive();
     if (this.peer) await this.disconnect();
@@ -106,10 +133,18 @@ class WebRTCTransport implements VoiceTransport {
     this.sender = transceiver.sender;
     this.bindPeer(peer, control);
 
+    // Trickle: the offer goes as soon as it exists and each candidate follows as it is
+    // found, rather than holding the offer until gathering finishes. Gathering ends only
+    // when every candidate has resolved or timed out, and a TURN allocation can take
+    // seconds — all of it spent before the gateway has heard anything at all.
+    if (connection.candidatesUrl) this.trickle(peer, connection);
+
     try {
       const offer = await peer.createOffer();
       await peer.setLocalDescription(offer);
-      await waitForIceGathering(peer);
+      // Without a candidates endpoint there is nowhere to send them, so the offer has to
+      // carry them and the wait is unavoidable.
+      if (!connection.candidatesUrl) await waitForIceGathering(peer);
       if (!peer.localDescription) throw new Error('Fennec could not create a WebRTC offer.');
       const response = await this.fetch(connection.connectionUrl, {
         method: 'POST',

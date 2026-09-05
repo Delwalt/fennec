@@ -6,6 +6,10 @@ export type FennecIceServer = {
 
 export type FennecConnection = {
   connectionUrl: string;
+  /** Where to post candidates found after the offer was sent. Without it the offer must
+   *  wait for gathering to finish, which is the difference between connecting in a
+   *  fraction of a second and waiting on a TURN allocation. */
+  candidatesUrl?: string;
   accessToken: string;
   /** Session-scoped TURN credentials from the gateway. Without them a browser offers
    *  only host candidates, which never reach a gateway on another machine. */

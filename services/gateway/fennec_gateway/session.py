@@ -123,8 +123,7 @@ class VoiceSession:
             return
         self.control_channel = channel
 
-        @channel.on("open")
-        def on_open() -> None:
+        def announce() -> None:
             channel.send(
                 _event(
                     "session.ready",
@@ -134,6 +133,15 @@ class VoiceSession:
             )
             if self.conversation is not None:
                 channel.send(_event("state.changed", state="listening"))
+
+        # A channel can already be open by the time its event reaches us, and "open" does
+        # not fire again for a listener attached afterwards. Missing it costs the client
+        # its only unprompted state: it stays on "connecting" until the speaker says
+        # something, which reads as a connection that never finished.
+        if channel.readyState == "open":
+            announce()
+        else:
+            channel.on("open")(announce)
 
         @channel.on("message")
         def on_message(message: Any) -> None:

@@ -13,10 +13,12 @@ describe('direct WebRTC transport', () => {
     expect(toFennecConnection({
       sessionId: 'session-1',
       signalingUrl: 'https://fennec.test/v1/sessions/session-1/offer',
+      candidatesUrl: 'https://fennec.test/v1/sessions/session-1/candidates',
       accessToken: 'short-lived-token',
       expiresAt: '2026-08-17T16:00:00Z',
     })).toEqual({
       connectionUrl: 'https://fennec.test/v1/sessions/session-1/offer',
+      candidatesUrl: 'https://fennec.test/v1/sessions/session-1/candidates',
       accessToken: 'short-lived-token',
       // A gateway on the same host mints no relay, and an empty list is how that arrives.
       iceServers: [],
@@ -59,6 +61,47 @@ describe('direct WebRTC transport', () => {
     }).iceServers).toEqual([{ urls: 'turn:relay:3478', username: 'u', credential: 'c' }]);
   });
 
+  it('sends the offer before gathering finishes, then trickles each candidate', async () => {
+    // Holding the offer until gathering completes spends a TURN allocation's worth of
+    // seconds before the gateway has heard anything at all. The offer goes first.
+    const peer = new FakePeerConnection();
+    peer.iceGatheringState = 'gathering';
+    const posts: { url: string; body: unknown }[] = [];
+    const transport = createWebRTCTransport({
+      fetch: async (url, init) => {
+        posts.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+        return Response.json({ type: 'answer', sdp: 'answer-sdp' });
+      },
+      createPeerConnection: () => peer as unknown as RTCPeerConnection,
+    });
+
+    await transport.connect({
+      connectionUrl: 'https://fennec.test/offer',
+      candidatesUrl: 'https://fennec.test/candidates',
+      accessToken: 'voice-token',
+    });
+
+    // Connected without gathering ever completing.
+    expect(peer.iceGatheringState).toBe('gathering');
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.url).toBe('https://fennec.test/offer');
+
+    peer.dispatchEvent(
+      Object.assign(new Event('icecandidate'), {
+        candidate: { candidate: 'candidate:1 1 udp 1 10.0.0.1 1 typ host', sdpMid: '0', sdpMLineIndex: 0 },
+      }),
+    );
+    // The end-of-gathering marker is not a candidate and must not be posted.
+    peer.dispatchEvent(Object.assign(new Event('icecandidate'), { candidate: null }));
+    await Promise.resolve();
+
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toMatchObject({
+      url: 'https://fennec.test/candidates',
+      body: { candidate: 'candidate:1 1 udp 1 10.0.0.1 1 typ host', sdpMid: '0', sdpMLineIndex: 0 },
+    });
+  });
+
   it('offers what it has rather than waiting on gathering forever', async () => {
     // Gathering completes only once every candidate resolves, and a TURN allocation the
     // network silently drops never does. Unbounded, that leaves a caller connecting with
@@ -72,6 +115,7 @@ describe('direct WebRTC transport', () => {
       createPeerConnection: () => peer as unknown as RTCPeerConnection,
     });
 
+    // No candidates endpoint, so the offer must carry them and the wait is unavoidable.
     const connecting = transport.connect({
       connectionUrl: 'https://fennec.test/offer',
       accessToken: 'voice-token',

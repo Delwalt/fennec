@@ -32,6 +32,7 @@ describe('@fennec/consumer', () => {
     const fetch = vi.fn(async () => Response.json({
       session_id: 'session-1',
       signaling_url: 'https://fennec.test/v1/sessions/session-1/offer',
+      candidates_url: 'https://fennec.test/v1/sessions/session-1/candidates',
       access_token: 'voice-token',
       expires_at: '2026-08-17T16:00:00Z',
       ice_servers: [{
@@ -57,6 +58,7 @@ describe('@fennec/consumer', () => {
     })).resolves.toEqual({
       sessionId: 'session-1',
       signalingUrl: 'https://fennec.test/v1/sessions/session-1/offer',
+      candidatesUrl: 'https://fennec.test/v1/sessions/session-1/candidates',
       accessToken: 'voice-token',
       expiresAt: '2026-08-17T16:00:00Z',
       // The gateway's per-session relay credential has to survive the hop to the browser,
