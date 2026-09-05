@@ -12,6 +12,7 @@ from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp
 from av import AudioResampler
 
+from .config import DEFAULT_TENANT_ID
 from .conversation import AudioBackpressureError, ConversationRuntime, ConversationSession
 from .media import AssistantAudioTrack
 from .session_configuration import VoiceConfiguration
@@ -32,6 +33,7 @@ class SessionCapacityError(RuntimeError):
 class VoiceSession:
     session_id: str
     expires_at: datetime
+    tenant_id: str = DEFAULT_TENANT_ID
     conversation_runtime: ConversationRuntime | None = None
     configuration: VoiceConfiguration | None = None
     rtc_configuration: RTCConfiguration | None = None
@@ -57,6 +59,7 @@ class VoiceSession:
                 output=output,
                 send_event=self._send_conversation_event,
                 configuration=self.configuration,
+                tenant_id=self.tenant_id,
             )
         peer.addTrack(output)
 
@@ -198,8 +201,9 @@ class VoiceSession:
         if self.peer_connection is not None:
             await self.peer_connection.close()
         logger.info(
-            "session closed session_id=%s microphone_frames=%d",
+            "session closed session_id=%s tenant=%s microphone_frames=%d",
             self.session_id,
+            self.tenant_id,
             self.microphone_frames,
         )
 
@@ -221,12 +225,14 @@ class SessionRegistry:
         *,
         session_id: str,
         expires_at: datetime,
+        tenant_id: str = DEFAULT_TENANT_ID,
         configuration: VoiceConfiguration | None = None,
         rtc_configuration: RTCConfiguration | None = None,
     ) -> VoiceSession:
         session = VoiceSession(
             session_id=session_id,
             expires_at=expires_at,
+            tenant_id=tenant_id,
             conversation_runtime=self._conversation_runtime,
             configuration=configuration,
             rtc_configuration=rtc_configuration,

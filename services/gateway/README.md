@@ -213,6 +213,30 @@ repeats in real sessions. Configuration outside these bounds fails at startup.
 The 1200 ms endpoint default favors natural thinking pauses over the shortest
 possible response latency; lower it only if repeated sessions feel too slow.
 
+## Tenants
+
+One gateway can serve several application backends. A tenant is identified by
+its service token, and that token alone decides which backend receives the
+session's turns - never `client_label` or anything else the caller asserts.
+Callback URLs come from this configuration only, so no caller can aim the
+gateway at a host of its choosing.
+
+```bash
+export FENNEC_TENANTS='[
+  {"id": "dex",   "service_token": "...", "consumer_url": "http://dex.internal/v1/turns",   "consumer_token": "..."},
+  {"id": "teamx", "service_token": "...", "consumer_url": "http://teamx.internal/v1/turns", "consumer_token": "..."}
+]'
+```
+
+Each entry may also carry `consumer_health_url`. Setting `FENNEC_TENANTS`
+replaces `FENNEC_SERVICE_TOKEN`, `FENNEC_CONSUMER_URL`,
+`FENNEC_CONSUMER_HEALTH_URL`, and `FENNEC_CONSUMER_TOKEN`; leave it unset and
+those four describe a single implicit tenant, which is what a one-application
+deployment wants. Ids and service tokens must be unique.
+
+The speech stack, TURN credentials, and `FENNEC_MAX_SESSIONS` stay shared
+across tenants - capacity is global, so one busy tenant can exhaust it.
+
 ## Application boundary
 
 - An application backend uses `@fennec/consumer` to create browser-safe sessions

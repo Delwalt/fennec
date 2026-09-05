@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 import json
 import logging
@@ -10,6 +10,7 @@ from time import monotonic
 from typing import Any
 
 from .audio import decode_audio_to_pcm16_mono, rms_dbfs
+from .config import DEFAULT_TENANT_ID
 from .media import AssistantAudioTrack
 from .providers import ConsumerProvider, FinalizedTurn, ProviderError, SpeechProvider
 from .session_configuration import VoiceConfiguration
@@ -455,12 +456,12 @@ class ConversationRuntime:
         self,
         *,
         speech: SpeechProvider,
-        consumer: ConsumerProvider,
+        consumers: Mapping[str, ConsumerProvider],
         default_configuration: VoiceConfiguration | None = None,
         detector_factory: Callable[[VoiceConfiguration], SileroTurnDetector] | None = None,
     ) -> None:
         self.speech = speech
-        self.consumer = consumer
+        self.consumers = dict(consumers)
         self._detector_factory = detector_factory
         self._default_configuration = default_configuration
         self._prepared_models: set[tuple[str, str]] = set()
@@ -492,9 +493,13 @@ class ConversationRuntime:
         output: AssistantAudioTrack,
         send_event: EventSink,
         configuration: VoiceConfiguration | None = None,
+        tenant_id: str = DEFAULT_TENANT_ID,
     ) -> ConversationSession:
         if not self._ready:
             raise RuntimeError("conversation services are not ready")
+        consumer = self.consumers.get(tenant_id)
+        if consumer is None:
+            raise RuntimeError(f"no consumer is configured for tenant {tenant_id!r}")
         resolved = configuration or self._default_configuration
         if self._detector_factory is not None and resolved is not None:
             detector = self._detector_factory(resolved)
@@ -511,7 +516,7 @@ class ConversationRuntime:
         return ConversationSession(
             session_id=session_id,
             speech=self.speech,
-            consumer=self.consumer,
+            consumer=consumer,
             output=output,
             send_event=send_event,
             detector=detector,
@@ -535,7 +540,11 @@ class ConversationRuntime:
         if self._warm_task is not None and not self._warm_task.done():
             self._warm_task.cancel()
             await asyncio.gather(self._warm_task, return_exceptions=True)
-        await asyncio.gather(self.speech.close(), self.consumer.close(), return_exceptions=True)
+        await asyncio.gather(
+            self.speech.close(),
+            *(consumer.close() for consumer in self.consumers.values()),
+            return_exceptions=True,
+        )
 
     async def _warm(self) -> None:
         delay = WARM_RETRY_SECONDS
@@ -560,12 +569,18 @@ class ConversationRuntime:
             return
 
     async def _warm_once(self) -> None:
-        # The consumer is someone else's service and restarts on its own schedule.
-        # Its absence must not stop Fennec becoming ready; turns fail loudly instead.
-        try:
-            await self.consumer.health()
-        except Exception as error:
-            logger.warning("consumer is unreachable; turns will fail until it returns: %s", error)
+        # A consumer is someone else's service and restarts on its own schedule.
+        # Its absence must not stop Fennec becoming ready, nor hold up the other
+        # tenants; that tenant's turns fail loudly instead.
+        for tenant_id, consumer in self.consumers.items():
+            try:
+                await consumer.health()
+            except Exception as error:
+                logger.warning(
+                    "consumer for tenant %s is unreachable; its turns will fail until it returns: %s",
+                    tenant_id,
+                    error,
+                )
         if self._default_configuration is None:
             await self.speech.ensure_models()
         else:

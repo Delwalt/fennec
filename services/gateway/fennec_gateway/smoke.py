@@ -211,7 +211,7 @@ async def run_smoke(
 
         session_response = await client.post(
             "http://127.0.0.1:8080/v1/sessions",
-            headers={"Authorization": f"Bearer {settings.service_token}"},
+            headers={"Authorization": f"Bearer {settings.resolved_tenants[0].service_token}"},
             json={"client_label": "container-smoke"},
         )
         session_response.raise_for_status()

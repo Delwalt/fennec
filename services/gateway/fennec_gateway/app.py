@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import SessionTokenError, issue_session_token, issue_turn_credential, verify_session_token
-from .config import Settings
+from .config import Settings, Tenant
 from .conversation import ConversationRuntime
 from .providers import HttpConsumerProvider, LocalSpeechProvider, ProviderError
 from .session import SessionCapacityError, SessionRegistry
@@ -121,12 +121,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 language=resolved.speech_language,
                 timeout_seconds=resolved.provider_timeout_seconds,
             ),
-            consumer=HttpConsumerProvider(
-                endpoint=resolved.consumer_url,
-                health_endpoint=resolved.consumer_health_url or None,
-                token=resolved.consumer_token,
-                timeout_seconds=resolved.provider_timeout_seconds,
-            ),
+            consumers={
+                tenant.id: HttpConsumerProvider(
+                    endpoint=tenant.consumer_url,
+                    health_endpoint=tenant.consumer_health_url or None,
+                    token=tenant.consumer_token,
+                    timeout_seconds=resolved.provider_timeout_seconds,
+                )
+                for tenant in resolved.resolved_tenants
+            },
             default_configuration=default_voice_configuration,
         )
     registry = SessionRegistry(
@@ -155,10 +158,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.registry = registry
     app.state.conversation_runtime = conversation_runtime
 
-    async def require_service_token(authorization: str | None = Header(default=None)) -> None:
+    async def require_tenant(authorization: str | None = Header(default=None)) -> Tenant:
+        """The service token is the tenant identity - it decides which backend
+        the session's turns are delivered to, so it is never taken from anything
+        the caller merely asserts (a client label, a header, a body field)."""
         token = _bearer_token(authorization)
-        if not hmac.compare_digest(token, resolved.service_token):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid service credential")
+        for tenant in resolved.resolved_tenants:
+            if hmac.compare_digest(token, tenant.service_token):
+                return tenant
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid service credential")
 
     def create_client_session() -> tuple[ClientSession, RTCConfiguration | None]:
         session_id = secrets.token_urlsafe(18)
@@ -179,6 +187,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return client_session, rtc_configuration
 
     async def register_client_session(
+        tenant: Tenant,
         configuration: VoiceConfigurationOverrides | None = None,
     ) -> ClientSession:
         if conversation_runtime is not None and not conversation_runtime.ready:
@@ -204,6 +213,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await registry.create(
                 session_id=client_session.session_id,
                 expires_at=client_session.expires_at,
+                tenant_id=tenant.id,
                 configuration=voice_configuration,
                 rtc_configuration=rtc_configuration,
             )
@@ -241,10 +251,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/v1/sessions",
         response_model=ClientSession,
         status_code=status.HTTP_201_CREATED,
-        dependencies=[Depends(require_service_token)],
     )
-    async def create_session(request: SessionCreateRequest) -> ClientSession:
-        return await register_client_session(request.configuration)
+    async def create_session(
+        request: SessionCreateRequest,
+        tenant: Tenant = Depends(require_tenant),
+    ) -> ClientSession:
+        return await register_client_session(tenant, request.configuration)
 
     @app.post("/dev/sessions", response_model=ClientSession, status_code=status.HTTP_201_CREATED)
     async def create_dev_session(
@@ -252,7 +264,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> ClientSession:
         if not resolved.dev_mode:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        return await register_client_session(request.configuration if request else None)
+        return await register_client_session(
+            resolved.resolved_tenants[0],
+            request.configuration if request else None,
+        )
 
     @app.post("/v1/sessions/{session_id}/offer", response_model=SessionDescription)
     async def accept_offer(
