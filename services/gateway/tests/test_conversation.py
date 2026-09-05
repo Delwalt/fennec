@@ -4,6 +4,8 @@ from io import BytesIO
 from unittest.mock import patch
 import wave
 
+import pytest
+
 from conftest import wait_until
 from fennec_gateway import conversation
 from fennec_gateway.conversation import ConversationRuntime, ConversationSession, response_phrases
@@ -429,3 +431,69 @@ async def test_persistent_speech_failure_keeps_retrying_instead_of_giving_up() -
         await wait_until(lambda: speech.remaining_failures < attempted)
 
     await runtime.close()
+
+
+async def test_speech_during_the_unplayed_tail_is_a_barge_in_not_a_new_turn() -> None:
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=BargeInDetector(),  # type: ignore[arg-type]
+    )
+    # Nothing plays this track, so every synthesized phrase is still queued when
+    # the last one is enqueued - the window the assistant is audibly speaking in.
+    conversation.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while [event for event, _ in events].count("assistant.text.delta") < 2:
+            await asyncio.sleep(0.01)
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+
+    event_names = [event for event, _ in events]
+    assert "assistant.done" not in event_names
+    assert event_names.index("assistant.cancelled") < len(event_names)
+    cancelled = [data for event, data in events if event == "assistant.cancelled"]
+    assert cancelled[0]["reason"] == "user_speech"
+    assert cancelled[0]["level_dbfs"] <= 0
+
+    await conversation.close()
+    output.stop()
+
+
+async def test_turn_latency_attributes_every_stage_of_the_first_audio() -> None:
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=ScriptedDetector(),  # type: ignore[arg-type]
+    )
+    conversation.feed_audio(bytes(640))
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.done")
+    await conversation.close()
+    output.stop()
+
+    latency = [data for event, data in events if event == "turn.latency"][0]
+    stages = (
+        "endpoint_delay_ms",
+        "stt_ms",
+        "llm_first_delta_ms",
+        "phrase_ms",
+        "tts_ms",
+        "decode_ms",
+        "enqueue_ms",
+    )
+    assert all(latency[stage] >= 0 for stage in stages)
+    assert sum(latency[stage] for stage in stages) == pytest.approx(
+        latency["first_audio_queued_ms"], abs=5
+    )
+    assert latency["speech_ms"] > 0
+    assert "text" not in latency

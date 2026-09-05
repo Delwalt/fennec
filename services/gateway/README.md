@@ -150,17 +150,51 @@ developer switches remain server-owned.
 
 The `fennec-control` data channel accepts `ping`, `audio.check`, and
 `session.close`. It emits `speech.started`, `turn.committed`,
-`transcript.final`, `assistant.text.delta`, `assistant.speaking`,
-`assistant.done`, `assistant.cancelled`, `state.changed`, and bounded `error`
-events. There is deliberately no parallel signaling WebSocket.
+`transcript.final`, `turn.latency`, `assistant.text.delta`,
+`assistant.speaking`, `assistant.done`, `assistant.cancelled`, `state.changed`,
+and bounded `error` events. There is deliberately no parallel signaling
+WebSocket.
+
+`assistant.done` and the return to `listening` wait for the queued reply to
+finish playing, not for its last phrase to be enqueued. Enqueuing runs seconds
+ahead of the speaker, and announcing an idle session there meant Fennec's own
+tail arrived as a fresh user turn instead of a barge-in.
+
+### Where a slow reply went
+
+`turn.latency` is emitted once per turn, when the first assistant audio is
+queued. Its stages sum to `first_audio_queued_ms`, so a slow reply is
+attributable to one stage rather than to the pipeline as a whole:
+
+| Field | Time spent |
+| --- | --- |
+| `endpoint_delay_ms` | silence Silero waited out before committing the turn |
+| `stt_ms` | the Whisper request |
+| `llm_first_delta_ms` | the consumer's first token |
+| `phrase_ms` | first token to the first speakable phrase |
+| `tts_ms` | the Kokoro request for that phrase |
+| `decode_ms` | WAV to 48 kHz PCM |
+| `enqueue_ms` | handing frames to the assistant track |
+| `speech_ms` | audio produced; over `tts_ms` it is Kokoro's real-time factor |
+
+`turn_queue_ms` rides along but is deliberately outside that sum — detection to
+the turn worker picking the turn up is a wall-clock wait that falls *inside* the
+endpointing window, so adding it would count the same time twice. It is worth
+watching on its own: a non-trivial value means Silero is running behind the
+microphone rather than the pipeline being slow.
+
+`speech.started` and `assistant.cancelled` carry `level_dbfs`, the loudness of
+the frame that confirmed speech. A barge-in far quieter than a talker in front
+of the microphone is residual echo the browser's canceller let through, not the
+user.
 
 On normal session close the channel also emits `telemetry.session.summary`.
 It contains counts, queue peaks, rejected-frame counts, and bounded
-median/p95/max distributions for endpointing, final transcription, first audio
-queued at the gateway, and confirmed interruption cancellation. It contains no
-transcript or audio content. `continued_segments` counts speech fragments that
-arrived while an earlier fragment was still being transcribed and were safely
-joined before dispatch to the consumer.
+median/p95/max distributions for every `turn.latency` stage plus `vad_feed_ms`
+(one Silero evaluation), `llm_total_ms`, and confirmed interruption
+cancellation. It contains no transcript or audio content. `continued_segments`
+counts speech fragments that arrived while an earlier fragment was still being
+transcribed and were safely joined before dispatch to the consumer.
 
 ## Turn settings
 

@@ -9,7 +9,7 @@ import secrets
 from time import monotonic
 from typing import Any
 
-from .audio import decode_audio_to_pcm16_mono
+from .audio import decode_audio_to_pcm16_mono, rms_dbfs
 from .media import AssistantAudioTrack
 from .providers import ConsumerProvider, FinalizedTurn, ProviderError, SpeechProvider
 from .session_configuration import VoiceConfiguration
@@ -21,6 +21,9 @@ logger = logging.getLogger("fennec.gateway")
 EventSink = Callable[[str, dict[str, Any]], None]
 WARM_RETRY_SECONDS = 5
 MAX_WARM_RETRY_SECONDS = 60
+# ponytail: fixed allowance for the browser's jitter buffer. A real playout
+# estimate would need RTCP receiver reports read back from the peer connection.
+PLAYBACK_TAIL_SECONDS = 0.25
 
 
 class AudioBackpressureError(RuntimeError):
@@ -32,6 +35,7 @@ class FinalizedAudio:
     pcm: bytes
     forced_by_limit: bool
     speech_end_delay_ms: float
+    detected_at: float
 
 
 class ConversationSession:
@@ -114,16 +118,20 @@ class ConversationSession:
         try:
             while True:
                 pcm = await self._audio_queue.get()
+                fed_at = monotonic()
                 detection = await asyncio.to_thread(self._detector.feed, pcm)
+                self._telemetry.timing("vad_feed_ms", (monotonic() - fed_at) * 1_000)
                 if detection.speech_started:
                     confirmed_at = monotonic()
-                    self._emit("speech.started")
+                    level_dbfs = rms_dbfs(pcm)
+                    self._emit("speech.started", level_dbfs=level_dbfs)
                     if self._assistant_active:
                         self._pending_interruption = True
                         await self._cancel_generation(
                             reason="user_speech",
                             notify=True,
                             confirmed_at=confirmed_at,
+                            level_dbfs=level_dbfs,
                         )
                     elif (
                         self._generation_task is not None
@@ -138,6 +146,7 @@ class ConversationSession:
                                 pcm=detection.finalized_audio,
                                 forced_by_limit=detection.forced_by_limit,
                                 speech_end_delay_ms=detection.speech_end_delay_ms,
+                                detected_at=monotonic(),
                             )
                         )
                     except asyncio.QueueFull as error:
@@ -159,13 +168,7 @@ class ConversationSession:
         try:
             while True:
                 finalized = await self._turn_queue.get()
-                task = asyncio.create_task(
-                    self._run_turn(
-                        finalized.pcm,
-                        forced_by_limit=finalized.forced_by_limit,
-                        speech_end_delay_ms=finalized.speech_end_delay_ms,
-                    )
-                )
+                task = asyncio.create_task(self._run_turn(finalized))
                 self._generation_task = task
                 try:
                     await task
@@ -178,32 +181,31 @@ class ConversationSession:
         except asyncio.CancelledError:
             raise
 
-    async def _run_turn(
-        self,
-        pcm: bytes,
-        *,
-        forced_by_limit: bool,
-        speech_end_delay_ms: float,
-    ) -> None:
+    async def _run_turn(self, finalized: FinalizedAudio) -> None:
+        pcm = finalized.pcm
+        speech_end_delay_ms = finalized.speech_end_delay_ms
         turn_id = secrets.token_urlsafe(12)
         generation_id = secrets.token_urlsafe(12)
         self._generation_id = generation_id
-        speech_ended_at = monotonic() - speech_end_delay_ms / 1_000
+        started_at = monotonic()
+        speech_ended_at = started_at - speech_end_delay_ms / 1_000
+        queue_ms = (started_at - finalized.detected_at) * 1_000
         self._telemetry.turns_committed += 1
-        self._telemetry.timing("endpoint_delay_ms", speech_end_delay_ms)
-        if forced_by_limit:
+        self._telemetry.timing("turn_queue_ms", queue_ms)
+        if finalized.forced_by_limit:
             self._telemetry.forced_turns += 1
         self._emit(
             "turn.committed",
             turn_id=turn_id,
             generation_id=generation_id,
-            forced_by_limit=forced_by_limit,
+            forced_by_limit=finalized.forced_by_limit,
             audio_ms=round(len(pcm) / 32, 1),
             endpoint_delay_ms=round(speech_end_delay_ms, 1),
         )
         self._emit("state.changed", state="transcribing", turn_id=turn_id)
 
         try:
+            stt_started_at = monotonic()
             if self._configuration is None:
                 text = await self._speech.transcribe(pcm)
             else:
@@ -245,6 +247,8 @@ class ConversationSession:
             self._assistant_active = True
             self._output.begin_generation(generation_id)
             first_audio = True
+            first_delta_at: list[float] = []
+            respond_at = monotonic()
             turn = FinalizedTurn(
                 session_id=self._session_id,
                 turn_id=turn_id,
@@ -252,9 +256,10 @@ class ConversationSession:
                 text=combined_text,
             )
             async for phrase in response_phrases(
-                self._consumer.respond(turn),
+                _stamp_first_delta(self._consumer.respond(turn), first_delta_at),
                 max_delay_seconds=self._phrase_delay_seconds,
             ):
+                phrase_at = monotonic()
                 if generation_id != self._generation_id:
                     return
                 self._emit(
@@ -270,11 +275,13 @@ class ConversationSession:
                         model=self._configuration.tts_model,
                         voice=self._configuration.tts_voice,
                     )
+                synthesized_at = monotonic()
                 pcm48 = await asyncio.to_thread(
                     decode_audio_to_pcm16_mono,
                     wav,
                     sample_rate=48_000,
                 )
+                decoded_at = monotonic()
                 queued = await self._output.enqueue_pcm(
                     generation_id=generation_id,
                     pcm=pcm48,
@@ -283,15 +290,39 @@ class ConversationSession:
                     return
                 if first_audio:
                     first_audio = False
-                    first_audio_latency_ms = (monotonic() - speech_ended_at) * 1_000
-                    self._telemetry.timing("first_audio_queued_ms", first_audio_latency_ms)
-                    self._emit(
-                        "assistant.speaking",
+                    queued_at = monotonic()
+                    self._report_first_audio(
+                        turn_id=turn_id,
                         generation_id=generation_id,
-                        latency_ms=round(first_audio_latency_ms, 1),
+                        stages={
+                            "endpoint_delay_ms": speech_end_delay_ms,
+                            "stt_ms": (transcript_at - stt_started_at) * 1_000,
+                            "llm_first_delta_ms": (
+                                (first_delta_at[0] if first_delta_at else phrase_at) - respond_at
+                            )
+                            * 1_000,
+                            "phrase_ms": (
+                                phrase_at - (first_delta_at[0] if first_delta_at else respond_at)
+                            )
+                            * 1_000,
+                            "tts_ms": (synthesized_at - phrase_at) * 1_000,
+                            "decode_ms": (decoded_at - synthesized_at) * 1_000,
+                            "enqueue_ms": (queued_at - decoded_at) * 1_000,
+                            "first_audio_queued_ms": (queued_at - speech_ended_at) * 1_000,
+                        },
+                        # Against tts_ms this is the synthesizer's real-time
+                        # factor: above 1.0 means TTS cannot keep the speaker fed.
+                        speech_ms=len(pcm48) / 96,
+                        turn_queue_ms=queue_ms,
                     )
                     self._emit("state.changed", state="speaking", generation_id=generation_id)
 
+            self._telemetry.timing("llm_total_ms", (monotonic() - respond_at) * 1_000)
+            # The last phrase is enqueued seconds before the speaker finishes
+            # saying it. Announcing "listening" here dropped the session back to
+            # idle mid-sentence, so Fennec's own tail arrived as a fresh user
+            # turn instead of a barge-in against a still-speaking assistant.
+            await asyncio.sleep(self._output.queued_seconds + PLAYBACK_TAIL_SECONDS)
             self._emit("assistant.done", generation_id=generation_id)
             self._telemetry.generations_completed += 1
             self._emit("state.changed", state="listening")
@@ -319,12 +350,46 @@ class ConversationSession:
             if self._generation_id == generation_id:
                 self._generation_id = None
 
+    def _report_first_audio(
+        self,
+        *,
+        turn_id: str,
+        generation_id: str,
+        stages: dict[str, float],
+        speech_ms: float,
+        turn_queue_ms: float,
+    ) -> None:
+        """Attribute speech-end to first assistant audio across every stage.
+
+        One event per turn, so a slow reply can be blamed on a stage rather than
+        on the pipeline as a whole. The stages before `first_audio_queued_ms`
+        sum to it. `turn_queue_ms` is not one of them: it measures a wall-clock
+        wait that falls *inside* the endpointing window, and adding it would
+        count that time twice.
+        """
+        for name, milliseconds in stages.items():
+            self._telemetry.timing(name, milliseconds)
+        self._emit(
+            "turn.latency",
+            turn_id=turn_id,
+            generation_id=generation_id,
+            speech_ms=round(speech_ms, 1),
+            turn_queue_ms=round(turn_queue_ms, 1),
+            **{name: round(milliseconds, 1) for name, milliseconds in stages.items()},
+        )
+        self._emit(
+            "assistant.speaking",
+            generation_id=generation_id,
+            latency_ms=round(stages["first_audio_queued_ms"], 1),
+        )
+
     async def _cancel_generation(
         self,
         *,
         reason: str,
         notify: bool,
         confirmed_at: float | None = None,
+        level_dbfs: float | None = None,
     ) -> None:
         generation_id = self._generation_id
         task = self._generation_task
@@ -346,6 +411,9 @@ class ConversationSession:
                 generation_id=generation_id,
                 reason=reason,
                 latency_ms=round(latency_ms, 1),
+                # A barge-in far quieter than a talker in front of the microphone
+                # is echo the browser's canceller let through, not the user.
+                **({} if level_dbfs is None else {"level_dbfs": level_dbfs}),
             )
 
     def _emit(self, event_type: str, **data: Any) -> None:
@@ -526,6 +594,18 @@ class ConversationRuntime:
             )
         if not transcript:
             raise ProviderError("local speech warm-up returned an empty transcript")
+
+
+async def _stamp_first_delta(
+    deltas: AsyncIterator[str],
+    mark: list[float],
+) -> AsyncIterator[str]:
+    """Record when the consumer's first token arrived, separating how long it
+    thought from how long phrase assembly then held the audio back."""
+    async for delta in deltas:
+        if not mark:
+            mark.append(monotonic())
+        yield delta
 
 
 async def response_phrases(
