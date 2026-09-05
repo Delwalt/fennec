@@ -2,6 +2,32 @@ import { describe, expect, it, vi } from 'vitest';
 import { createFennecConsumer } from '../src/index.ts';
 
 describe('@fennec/consumer', () => {
+  it('repeats the gateway\'s reason for refusing a session', async () => {
+    const fennec = createFennecConsumer({
+      gatewayUrl: 'https://fennec.test',
+      serviceCredential: 'service-secret',
+      fetch: async () => Response.json({ detail: 'voice session capacity reached' }, { status: 503 }),
+      respond: async function* () {},
+    });
+
+    await expect(fennec.createClientSession()).rejects.toThrow(
+      'Fennec session creation failed with HTTP 503. voice session capacity reached',
+    );
+  });
+
+  it('falls back to the status when the gateway explains nothing', async () => {
+    const fennec = createFennecConsumer({
+      gatewayUrl: 'https://fennec.test',
+      serviceCredential: 'service-secret',
+      fetch: async () => new Response('not json at all', { status: 502 }),
+      respond: async function* () {},
+    });
+
+    await expect(fennec.createClientSession()).rejects.toThrow(
+      'Fennec session creation failed with HTTP 502.',
+    );
+  });
+
   it('creates a safe client session through the authenticated gateway API', async () => {
     const fetch = vi.fn(async () => Response.json({
       session_id: 'session-1',

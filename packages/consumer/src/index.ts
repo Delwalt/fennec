@@ -78,7 +78,12 @@ export function createFennecConsumer(options: FennecConsumerOptions): FennecCons
         }),
       });
       if (!response.ok) {
-        throw new Error(`Fennec session creation failed with HTTP ${response.status}.`);
+        // The gateway says why in `detail`, and the difference matters to whoever reads
+        // it: a full gateway is nothing like a rejected credential, but an HTTP number
+        // alone makes them look the same.
+        throw new Error(
+          `Fennec session creation failed with HTTP ${response.status}.${await reason(response)}`,
+        );
       }
       return parseClientSession(await response.json());
     },
@@ -164,6 +169,17 @@ export function createFennecConsumer(options: FennecConsumerOptions): FennecCons
       };
     },
   };
+}
+
+/** The gateway's own explanation, when it gave one. Never throws: this runs on a path
+ *  that is already failing, and a body that will not parse must not replace the status. */
+async function reason(response: Response): Promise<string> {
+  try {
+    const detail = (JSON.parse(await response.text()) as { detail?: unknown }).detail;
+    return typeof detail === 'string' && detail ? ` ${detail}` : '';
+  } catch {
+    return '';
+  }
 }
 
 function parseClientSession(value: unknown): FennecClientSession {
