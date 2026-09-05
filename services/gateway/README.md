@@ -150,17 +150,51 @@ developer switches remain server-owned.
 
 The `fennec-control` data channel accepts `ping`, `audio.check`, and
 `session.close`. It emits `speech.started`, `turn.committed`,
-`transcript.final`, `assistant.text.delta`, `assistant.speaking`,
-`assistant.done`, `assistant.cancelled`, `state.changed`, and bounded `error`
-events. There is deliberately no parallel signaling WebSocket.
+`transcript.final`, `turn.latency`, `assistant.text.delta`,
+`assistant.speaking`, `assistant.done`, `assistant.cancelled`, `state.changed`,
+and bounded `error` events. There is deliberately no parallel signaling
+WebSocket.
+
+`assistant.done` and the return to `listening` wait for the queued reply to
+finish playing, not for its last phrase to be enqueued. Enqueuing runs seconds
+ahead of the speaker, and announcing an idle session there meant Fennec's own
+tail arrived as a fresh user turn instead of a barge-in.
+
+### Where a slow reply went
+
+`turn.latency` is emitted once per turn, when the first assistant audio is
+queued. Its stages sum to `first_audio_queued_ms`, so a slow reply is
+attributable to one stage rather than to the pipeline as a whole:
+
+| Field | Time spent |
+| --- | --- |
+| `endpoint_delay_ms` | silence Silero waited out before committing the turn |
+| `stt_ms` | the Whisper request |
+| `llm_first_delta_ms` | the consumer's first token |
+| `phrase_ms` | first token to the first speakable phrase |
+| `tts_ms` | the Kokoro request for that phrase |
+| `decode_ms` | WAV to 48 kHz PCM |
+| `enqueue_ms` | handing frames to the assistant track |
+| `speech_ms` | audio produced; over `tts_ms` it is Kokoro's real-time factor |
+
+`turn_queue_ms` rides along but is deliberately outside that sum — detection to
+the turn worker picking the turn up is a wall-clock wait that falls *inside* the
+endpointing window, so adding it would count the same time twice. It is worth
+watching on its own: a non-trivial value means Silero is running behind the
+microphone rather than the pipeline being slow.
+
+`speech.started` and `assistant.cancelled` carry `level_dbfs`, the loudness of
+the frame that confirmed speech. A barge-in far quieter than a talker in front
+of the microphone is residual echo the browser's canceller let through, not the
+user.
 
 On normal session close the channel also emits `telemetry.session.summary`.
 It contains counts, queue peaks, rejected-frame counts, and bounded
-median/p95/max distributions for endpointing, final transcription, first audio
-queued at the gateway, and confirmed interruption cancellation. It contains no
-transcript or audio content. `continued_segments` counts speech fragments that
-arrived while an earlier fragment was still being transcribed and were safely
-joined before dispatch to the consumer.
+median/p95/max distributions for every `turn.latency` stage plus `vad_feed_ms`
+(one Silero evaluation), `llm_total_ms`, and confirmed interruption
+cancellation. It contains no transcript or audio content. `continued_segments`
+counts speech fragments that arrived while an earlier fragment was still being
+transcribed and were safely joined before dispatch to the consumer.
 
 ## Turn settings
 
@@ -178,6 +212,30 @@ Keep the defaults until the same pause, clipping, or false-interruption pattern
 repeats in real sessions. Configuration outside these bounds fails at startup.
 The 1200 ms endpoint default favors natural thinking pauses over the shortest
 possible response latency; lower it only if repeated sessions feel too slow.
+
+## Tenants
+
+One gateway can serve several application backends. A tenant is identified by
+its service token, and that token alone decides which backend receives the
+session's turns - never `client_label` or anything else the caller asserts.
+Callback URLs come from this configuration only, so no caller can aim the
+gateway at a host of its choosing.
+
+```bash
+export FENNEC_TENANTS='[
+  {"id": "dex",   "service_token": "...", "consumer_url": "http://dex.internal/v1/turns",   "consumer_token": "..."},
+  {"id": "teamx", "service_token": "...", "consumer_url": "http://teamx.internal/v1/turns", "consumer_token": "..."}
+]'
+```
+
+Each entry may also carry `consumer_health_url`. Setting `FENNEC_TENANTS`
+replaces `FENNEC_SERVICE_TOKEN`, `FENNEC_CONSUMER_URL`,
+`FENNEC_CONSUMER_HEALTH_URL`, and `FENNEC_CONSUMER_TOKEN`; leave it unset and
+those four describe a single implicit tenant, which is what a one-application
+deployment wants. Ids and service tokens must be unique.
+
+The speech stack, TURN credentials, and `FENNEC_MAX_SESSIONS` stay shared
+across tenants - capacity is global, so one busy tenant can exhaust it.
 
 ## Application boundary
 

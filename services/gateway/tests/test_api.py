@@ -4,7 +4,7 @@ from httpx import ASGITransport, AsyncClient
 
 from fennec_gateway.app import create_app
 from fennec_gateway.auth import issue_session_token
-from fennec_gateway.config import Settings
+from fennec_gateway.config import Settings, Tenant
 
 
 SERVICE_TOKEN = "test-service-token-at-least-24-characters"
@@ -228,3 +228,58 @@ async def test_conversation_profile_refuses_sessions_until_dependencies_are_read
     assert readiness.status_code == 503
     assert readiness.json()["status"] == "warming"
     assert session.status_code == 503
+
+
+DEX_TOKEN = "dex-service-token-at-least-24-characters"
+TEAMX_TOKEN = "teamx-service-token-at-least-24-characters"
+MULTI_TENANT_SETTINGS = Settings(
+    service_token="",
+    session_secret="test-session-secret-at-least-32-characters-long",
+    public_base_url="http://gateway.test",
+    tenants=(
+        Tenant(id="dex", service_token=DEX_TOKEN, consumer_url="http://dex.internal/v1/turns"),
+        Tenant(id="teamx", service_token=TEAMX_TOKEN, consumer_url="http://teamx.internal/v1/turns"),
+    ),
+)
+
+
+async def test_each_tenant_opens_sessions_with_its_own_service_token() -> None:
+    app = create_app(MULTI_TENANT_SETTINGS)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        dex = await client.post("/v1/sessions", headers={"Authorization": f"Bearer {DEX_TOKEN}"}, json={})
+        teamx = await client.post(
+            "/v1/sessions",
+            headers={"Authorization": f"Bearer {TEAMX_TOKEN}"},
+            json={},
+        )
+        stranger = await client.post(
+            "/v1/sessions",
+            headers={"Authorization": f"Bearer {SERVICE_TOKEN}"},
+            json={},
+        )
+
+    assert dex.status_code == 201
+    assert teamx.status_code == 201
+    assert stranger.status_code == 403
+
+    registry = app.state.registry
+    now = datetime.now(timezone.utc)
+    assert (await registry.get(dex.json()["session_id"], now=now)).tenant_id == "dex"
+    assert (await registry.get(teamx.json()["session_id"], now=now)).tenant_id == "teamx"
+
+
+async def test_a_client_label_cannot_choose_the_tenant_it_is_delivered_to() -> None:
+    # The label is descriptive only: routing follows the service token, so a browser
+    # calling itself "teamx" never reaches TeamX's backend.
+    app = create_app(MULTI_TENANT_SETTINGS)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/sessions",
+            headers={"Authorization": f"Bearer {DEX_TOKEN}"},
+            json={"client_label": "teamx"},
+        )
+
+    session = await app.state.registry.get(
+        response.json()["session_id"], now=datetime.now(timezone.utc)
+    )
+    assert session.tenant_id == "dex"

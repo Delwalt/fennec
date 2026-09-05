@@ -42,6 +42,11 @@ class AssistantAudioTrack(MediaStreamTrack):
         return self._queue.qsize()
 
     @property
+    def queued_seconds(self) -> float:
+        """How much assistant speech is still waiting to be played."""
+        return self._queue.qsize() * self.samples_per_frame / self.sample_rate
+
+    @property
     def queued_peak_frames(self) -> int:
         return self._queued_peak
 

@@ -1,9 +1,27 @@
 from __future__ import annotations
 
 from io import BytesIO
+from math import log10
 import wave
 
 from av import AudioResampler, open as open_media
+import numpy as np
+
+
+SILENT_DBFS = -120.0
+
+
+def rms_dbfs(pcm: bytes) -> float:
+    """Loudness of one PCM16 frame, so a barge-in can be told apart from echo.
+
+    Residual echo that survives browser AEC arrives far quieter than the person
+    in front of the microphone; the level is the only signal that separates them.
+    """
+    if len(pcm) < 2:
+        return SILENT_DBFS
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32_768.0
+    rms = float(np.sqrt(np.mean(np.square(samples))))
+    return round(20 * log10(rms), 1) if rms > 0 else SILENT_DBFS
 
 
 def pcm16_mono_wav(pcm: bytes, *, sample_rate: int = 16_000) -> bytes:

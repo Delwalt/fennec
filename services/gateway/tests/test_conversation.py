@@ -4,6 +4,8 @@ from io import BytesIO
 from unittest.mock import patch
 import wave
 
+import pytest
+
 from conftest import wait_until
 from fennec_gateway import conversation
 from fennec_gateway.conversation import ConversationRuntime, ConversationSession, response_phrases
@@ -389,7 +391,7 @@ class BrokenThenWorkingSpeech(FakeSpeech):
 async def test_a_dead_consumer_at_boot_still_lets_the_gateway_become_ready() -> None:
     # Regression: the consumer is a third-party service. When it was unreachable at
     # boot the gateway used to stay un-ready forever and refuse every session with 503.
-    runtime = ConversationRuntime(speech=FakeSpeech(), consumer=UnreachableConsumer())
+    runtime = ConversationRuntime(speech=FakeSpeech(), consumers={"default": UnreachableConsumer()})
     with patch.object(conversation.SileroTurnDetector, "warm"):
         runtime.start()
         await wait_until(lambda: runtime.ready)
@@ -402,7 +404,7 @@ async def test_warm_up_retries_until_its_own_speech_dependency_returns() -> None
     # Regression: a single warm-up failure used to be terminal, so a gateway that
     # started before its speech models were reachable never recovered on its own.
     speech = BrokenThenWorkingSpeech(failures=2)
-    runtime = ConversationRuntime(speech=speech, consumer=FakeConsumer())
+    runtime = ConversationRuntime(speech=speech, consumers={"default": FakeConsumer()})
     with patch.object(conversation, "WARM_RETRY_SECONDS", 0), \
             patch.object(conversation, "MAX_WARM_RETRY_SECONDS", 0), \
             patch.object(conversation.SileroTurnDetector, "warm"):
@@ -417,7 +419,7 @@ async def test_persistent_speech_failure_keeps_retrying_instead_of_giving_up() -
     # A gateway that cannot reach its own speech models must report that it is still
     # trying, not settle into a terminal state that only a manual restart clears.
     speech = BrokenThenWorkingSpeech(failures=1_000)
-    runtime = ConversationRuntime(speech=speech, consumer=FakeConsumer())
+    runtime = ConversationRuntime(speech=speech, consumers={"default": FakeConsumer()})
     with patch.object(conversation, "WARM_RETRY_SECONDS", 0), \
             patch.object(conversation, "MAX_WARM_RETRY_SECONDS", 0), \
             patch.object(conversation.SileroTurnDetector, "warm"):
@@ -428,4 +430,98 @@ async def test_persistent_speech_failure_keeps_retrying_instead_of_giving_up() -
         assert not runtime.ready
         await wait_until(lambda: speech.remaining_failures < attempted)
 
+    await runtime.close()
+
+
+async def test_speech_during_the_unplayed_tail_is_a_barge_in_not_a_new_turn() -> None:
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=BargeInDetector(),  # type: ignore[arg-type]
+    )
+    # Nothing plays this track, so every synthesized phrase is still queued when
+    # the last one is enqueued - the window the assistant is audibly speaking in.
+    conversation.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while [event for event, _ in events].count("assistant.text.delta") < 2:
+            await asyncio.sleep(0.01)
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+
+    event_names = [event for event, _ in events]
+    assert "assistant.done" not in event_names
+    assert event_names.index("assistant.cancelled") < len(event_names)
+    cancelled = [data for event, data in events if event == "assistant.cancelled"]
+    assert cancelled[0]["reason"] == "user_speech"
+    assert cancelled[0]["level_dbfs"] <= 0
+
+    await conversation.close()
+    output.stop()
+
+
+async def test_turn_latency_attributes_every_stage_of_the_first_audio() -> None:
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=ScriptedDetector(),  # type: ignore[arg-type]
+    )
+    conversation.feed_audio(bytes(640))
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.done")
+    await conversation.close()
+    output.stop()
+
+    latency = [data for event, data in events if event == "turn.latency"][0]
+    stages = (
+        "endpoint_delay_ms",
+        "stt_ms",
+        "llm_first_delta_ms",
+        "phrase_ms",
+        "tts_ms",
+        "decode_ms",
+        "enqueue_ms",
+    )
+    assert all(latency[stage] >= 0 for stage in stages)
+    assert sum(latency[stage] for stage in stages) == pytest.approx(
+        latency["first_audio_queued_ms"], abs=5
+    )
+    assert latency["speech_ms"] > 0
+    assert "text" not in latency
+
+
+async def test_each_tenants_turns_go_only_to_that_tenants_consumer() -> None:
+    dex = FakeConsumer()
+    teamx = FakeConsumer()
+    runtime = ConversationRuntime(speech=FakeSpeech(), consumers={"dex": dex, "teamx": teamx})
+    with patch.object(conversation.SileroTurnDetector, "warm"):
+        runtime.start()
+        await wait_until(lambda: runtime.ready)
+
+    session = runtime.create_session(
+        session_id="s-1",
+        output=AssistantAudioTrack(),
+        send_event=lambda *_: None,
+        tenant_id="teamx",
+    )
+    assert session._consumer is teamx
+
+    with pytest.raises(RuntimeError, match="no consumer is configured for tenant"):
+        runtime.create_session(
+            session_id="s-2",
+            output=AssistantAudioTrack(),
+            send_event=lambda *_: None,
+            tenant_id="stranger",
+        )
+
+    await session.close()
     await runtime.close()

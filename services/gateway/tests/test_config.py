@@ -1,6 +1,6 @@
 import pytest
 
-from fennec_gateway.config import ConfigurationError, Settings
+from fennec_gateway.config import ConfigurationError, Settings, Tenant, _read_tenants
 
 
 def test_settings_require_strong_runtime_secrets() -> None:
@@ -76,3 +76,98 @@ def test_settings_require_complete_turn_configuration() -> None:
         turn_shared_secret="x" * 32,
     )
     assert settings.turn_shared_secret == "x" * 32
+
+
+def test_flat_consumer_settings_become_the_single_implicit_tenant() -> None:
+    settings = Settings(
+        service_token="x" * 24,
+        session_secret="x" * 32,
+        conversation_enabled=True,
+        consumer_url="http://backend.test/v1/turns",
+        consumer_token="y" * 24,
+    )
+
+    assert [tenant.id for tenant in settings.resolved_tenants] == ["default"]
+    assert settings.resolved_tenants[0].consumer_url == "http://backend.test/v1/turns"
+
+
+def test_configured_tenants_replace_the_flat_service_and_consumer_credentials() -> None:
+    settings = Settings(
+        service_token="",
+        session_secret="x" * 32,
+        conversation_enabled=True,
+        tenants=(
+            Tenant(
+                id="dex",
+                service_token="d" * 24,
+                consumer_url="http://dex.internal/v1/turns",
+                consumer_token="D" * 24,
+            ),
+            Tenant(
+                id="teamx",
+                service_token="t" * 24,
+                consumer_url="http://teamx.internal/v1/turns",
+                consumer_token="T" * 24,
+            ),
+        ),
+    )
+
+    assert [tenant.id for tenant in settings.resolved_tenants] == ["dex", "teamx"]
+
+
+def test_tenants_must_be_distinguishable_and_carry_their_own_consumer() -> None:
+    strong = "d" * 24
+    with pytest.raises(ConfigurationError, match="duplicate"):
+        Settings(
+            service_token="",
+            session_secret="x" * 32,
+            tenants=(
+                Tenant(id="dex", service_token=strong),
+                Tenant(id="dex", service_token="t" * 24),
+            ),
+        )
+
+    with pytest.raises(ConfigurationError, match="service tokens must be unique"):
+        Settings(
+            service_token="",
+            session_secret="x" * 32,
+            tenants=(
+                Tenant(id="dex", service_token=strong),
+                Tenant(id="teamx", service_token=strong),
+            ),
+        )
+
+    with pytest.raises(ConfigurationError, match="at least 24 characters"):
+        Settings(
+            service_token="",
+            session_secret="x" * 32,
+            tenants=(Tenant(id="dex", service_token="short"),),
+        )
+
+    with pytest.raises(ConfigurationError, match="tenant 'dex' consumer_url"):
+        Settings(
+            service_token="",
+            session_secret="x" * 32,
+            conversation_enabled=True,
+            tenants=(Tenant(id="dex", service_token=strong, consumer_token="D" * 24),),
+        )
+
+
+def test_tenant_json_is_parsed_strictly() -> None:
+    assert _read_tenants(None) == ()
+    assert _read_tenants("   ") == ()
+    assert _read_tenants(
+        '[{"id": "dex", "service_token": "d", "consumer_url": "http://dex.internal/v1/turns"}]'
+    ) == (Tenant(id="dex", service_token="d", consumer_url="http://dex.internal/v1/turns"),)
+
+    with pytest.raises(ConfigurationError, match="valid JSON"):
+        _read_tenants("not json")
+
+    with pytest.raises(ConfigurationError, match="non-empty JSON array"):
+        _read_tenants("[]")
+
+    with pytest.raises(ConfigurationError, match="needs id and service_token"):
+        _read_tenants('[{"id": "dex"}]')
+
+    with pytest.raises(ConfigurationError, match="unknown FENNEC_TENANTS keys: callback_url"):
+        _read_tenants('[{"id": "dex", "service_token": "d", "callback_url": "http://evil.test"}]')

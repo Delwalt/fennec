@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import defaultdict, deque
 from math import ceil
 from statistics import median
 from time import monotonic
@@ -11,12 +11,9 @@ class SessionTelemetry:
 
     def __init__(self, *, sample_limit: int = 512) -> None:
         self._started_at = monotonic()
-        self._samples: dict[str, deque[float]] = {
-            "endpoint_delay_ms": deque(maxlen=sample_limit),
-            "transcript_final_ms": deque(maxlen=sample_limit),
-            "first_audio_queued_ms": deque(maxlen=sample_limit),
-            "interruption_cancel_ms": deque(maxlen=sample_limit),
-        }
+        self._samples: defaultdict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=sample_limit)
+        )
         self.turns_committed = 0
         self.generations_completed = 0
         self.interruptions = 0
@@ -53,8 +50,8 @@ class SessionTelemetry:
             "output_queue_peak_frames": output_queue_peak_frames,
             "stale_audio_frames_rejected": stale_audio_frames_rejected,
             "latency_ms": {
-                name: _distribution(samples)
-                for name, samples in self._samples.items()
+                name: _distribution(self._samples[name])
+                for name in sorted(self._samples)
             },
         }
 
