@@ -11,7 +11,9 @@ export type FennecIceServer = {
 export type FennecClientSession = {
   sessionId: string;
   signalingUrl: string;
-  candidatesUrl: string;
+  /** Absent on a gateway too old to accept trickled candidates, which is not fatal: the
+   *  client falls back to carrying them in the offer. */
+  candidatesUrl?: string;
   accessToken: string;
   expiresAt: string;
   /** Session-scoped TURN credentials, expiring with the session. Empty when the gateway
@@ -188,7 +190,9 @@ function parseClientSession(value: unknown): FennecClientSession {
   return {
     sessionId: nonEmptyString(object.session_id),
     signalingUrl: nonEmptyString(object.signaling_url),
-    candidatesUrl: nonEmptyString(object.candidates_url),
+    ...(object.candidates_url === undefined
+      ? {}
+      : { candidatesUrl: nonEmptyString(object.candidates_url) }),
     accessToken: nonEmptyString(object.access_token),
     expiresAt: nonEmptyString(object.expires_at),
     iceServers: parseIceServers(object.ice_servers),

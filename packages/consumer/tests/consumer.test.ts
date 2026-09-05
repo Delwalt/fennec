@@ -2,6 +2,26 @@ import { describe, expect, it, vi } from 'vitest';
 import { createFennecConsumer } from '../src/index.ts';
 
 describe('@fennec/consumer', () => {
+  it('works with a gateway that cannot take trickled candidates', async () => {
+    // Older gateways send no candidates_url. Refusing the session over it would break a
+    // deployment that works perfectly well by carrying candidates in the offer.
+    const fennec = createFennecConsumer({
+      gatewayUrl: 'https://fennec.test',
+      serviceCredential: 'service-secret',
+      fetch: async () =>
+        Response.json({
+          session_id: 'session-1',
+          signaling_url: 'https://fennec.test/v1/sessions/session-1/offer',
+          access_token: 'voice-token',
+          expires_at: '2026-08-17T16:00:00Z',
+        }, { status: 201 }),
+      respond: async function* () {},
+    });
+
+    await expect(fennec.createClientSession()).resolves.toMatchObject({ sessionId: 'session-1' });
+    expect(await fennec.createClientSession()).not.toHaveProperty('candidatesUrl');
+  });
+
   it('repeats the gateway\'s reason for refusing a session', async () => {
     const fennec = createFennecConsumer({
       gatewayUrl: 'https://fennec.test',
