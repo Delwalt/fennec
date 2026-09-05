@@ -14,7 +14,45 @@ describe('direct WebRTC transport', () => {
     })).toEqual({
       connectionUrl: 'https://fennec.test/v1/sessions/session-1/offer',
       accessToken: 'short-lived-token',
+      // A gateway on the same host mints no relay, and an empty list is how that arrives.
+      iceServers: [],
     });
+  });
+
+  it('gives the peer connection the session\'s TURN credentials', async () => {
+    // Without them the browser offers only host candidates, which never reach a gateway
+    // on another machine — the whole reason the relay exists.
+    const iceServers = [{
+      urls: 'turn:100.116.8.95:3478?transport=udp',
+      username: '1788610000:session-1',
+      credential: 'derived-secret',
+    }];
+    let configuration: RTCConfiguration | undefined;
+    const transport = createWebRTCTransport({
+      fetch: async () => Response.json({ type: 'answer', sdp: 'answer-sdp' }),
+      createPeerConnection: (config) => {
+        configuration = config;
+        return new FakePeerConnection() as unknown as RTCPeerConnection;
+      },
+    });
+
+    await transport.connect({
+      connectionUrl: 'https://fennec.test/offer',
+      accessToken: 'voice-token',
+      iceServers,
+    });
+
+    expect(configuration?.iceServers).toEqual(iceServers);
+  });
+
+  it('carries the ICE servers from a client session into the connection', () => {
+    expect(toFennecConnection({
+      sessionId: 'session-1',
+      signalingUrl: 'https://fennec.test/v1/sessions/session-1/offer',
+      accessToken: 'short-lived-token',
+      expiresAt: '2026-08-17T16:00:00Z',
+      iceServers: [{ urls: 'turn:relay:3478', username: 'u', credential: 'c' }],
+    }).iceServers).toEqual([{ urls: 'turn:relay:3478', username: 'u', credential: 'c' }]);
   });
 
   it('calls fetch without making it a method of the transport', async () => {

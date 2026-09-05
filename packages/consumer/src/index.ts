@@ -2,11 +2,20 @@ import { timingSafeEqual } from 'node:crypto';
 
 const MAX_TURN_BYTES = 65_536;
 
+export type FennecIceServer = {
+  urls: string;
+  username: string;
+  credential: string;
+};
+
 export type FennecClientSession = {
   sessionId: string;
   signalingUrl: string;
   accessToken: string;
   expiresAt: string;
+  /** Session-scoped TURN credentials, expiring with the session. Empty when the gateway
+   *  runs without a relay, which is only ever true when the browser is on its host. */
+  iceServers: FennecIceServer[];
 };
 
 export type FennecTurn = {
@@ -164,7 +173,21 @@ function parseClientSession(value: unknown): FennecClientSession {
     signalingUrl: nonEmptyString(object.signaling_url),
     accessToken: nonEmptyString(object.access_token),
     expiresAt: nonEmptyString(object.expires_at),
+    iceServers: parseIceServers(object.ice_servers),
   };
+}
+
+function parseIceServers(value: unknown): FennecIceServer[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('fennec: ice_servers must be an array');
+  return value.map((entry) => {
+    const server = record(entry);
+    return {
+      urls: nonEmptyString(server.urls),
+      username: nonEmptyString(server.username),
+      credential: nonEmptyString(server.credential),
+    };
+  });
 }
 
 function serializeVoiceConfiguration(

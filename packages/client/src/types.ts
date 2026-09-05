@@ -1,6 +1,15 @@
+export type FennecIceServer = {
+  urls: string;
+  username: string;
+  credential: string;
+};
+
 export type FennecConnection = {
   connectionUrl: string;
   accessToken: string;
+  /** Session-scoped TURN credentials from the gateway. Without them a browser offers
+   *  only host candidates, which never reach a gateway on another machine. */
+  iceServers?: FennecIceServer[];
 };
 
 export type FennecConnectionState =

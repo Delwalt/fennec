@@ -8,6 +8,11 @@ describe('@fennec/consumer', () => {
       signaling_url: 'https://fennec.test/v1/sessions/session-1/offer',
       access_token: 'voice-token',
       expires_at: '2026-08-17T16:00:00Z',
+      ice_servers: [{
+        urls: 'turn:relay.test:3478?transport=udp',
+        username: '1788610000:session-1',
+        credential: 'derived-secret',
+      }],
     }, { status: 201 }));
     const fennec = createFennecConsumer({
       gatewayUrl: 'https://fennec.test/',
@@ -28,6 +33,13 @@ describe('@fennec/consumer', () => {
       signalingUrl: 'https://fennec.test/v1/sessions/session-1/offer',
       accessToken: 'voice-token',
       expiresAt: '2026-08-17T16:00:00Z',
+      // The gateway's per-session relay credential has to survive the hop to the browser,
+      // which is the only reason the browser can reach a gateway on another machine.
+      iceServers: [{
+        urls: 'turn:relay.test:3478?transport=udp',
+        username: '1788610000:session-1',
+        credential: 'derived-secret',
+      }],
     });
     expect(fetch).toHaveBeenCalledWith('https://fennec.test/v1/sessions', expect.objectContaining({
       headers: expect.objectContaining({ authorization: 'Bearer service-secret' }),

@@ -1,6 +1,7 @@
 import { retainTranscript } from '../conversation-transcripts.ts';
 import type {
   FennecConnection,
+  FennecIceServer,
   FennecTranscript,
   FennecVoiceState,
 } from '../types.ts';
@@ -13,11 +14,13 @@ export type FennecClientSession = {
   signalingUrl: string;
   accessToken: string;
   expiresAt: string;
+  iceServers?: FennecIceServer[];
 };
 
 export type WebRTCTransportOptions = {
   fetch?: typeof fetch;
-  createPeerConnection?: () => RTCPeerConnection;
+  /** Receives the session's ICE configuration; ignore it only when supplying a fake. */
+  createPeerConnection?: (configuration: RTCConfiguration) => RTCPeerConnection;
   createAudioElement?: () => HTMLAudioElement;
   microphoneProcessing?: FennecMicrophoneProcessing;
 };
@@ -32,6 +35,7 @@ export function toFennecConnection(session: FennecClientSession): FennecConnecti
   return {
     connectionUrl: session.signalingUrl,
     accessToken: session.accessToken,
+    iceServers: session.iceServers ?? [],
   };
 }
 
@@ -43,7 +47,7 @@ export function createWebRTCTransport(
 
 class WebRTCTransport implements VoiceTransport {
   private readonly fetch: typeof fetch;
-  private readonly createPeerConnection: () => RTCPeerConnection;
+  private readonly createPeerConnection: (configuration: RTCConfiguration) => RTCPeerConnection;
   private readonly createAudioElement: () => HTMLAudioElement;
   private readonly microphoneProcessing: Required<FennecMicrophoneProcessing>;
   private readonly listeners = new Set<(state: VoiceTransportState) => void>();
@@ -67,7 +71,8 @@ class WebRTCTransport implements VoiceTransport {
     // transport as its receiver, and a browser rejects that with "Failed to execute
     // 'fetch' on 'Window': Illegal invocation".
     this.fetch = (options.fetch ?? fetch).bind(globalThis);
-    this.createPeerConnection = options.createPeerConnection ?? (() => new RTCPeerConnection());
+    this.createPeerConnection =
+      options.createPeerConnection ?? ((configuration) => new RTCPeerConnection(configuration));
     this.createAudioElement =
       options.createAudioElement ??
       (() => {
@@ -91,7 +96,9 @@ class WebRTCTransport implements VoiceTransport {
     this.voiceState = 'connecting';
     this.emit();
 
-    const peer = this.createPeerConnection();
+    // The gateway mints a TURN credential per session; without it the browser offers only
+    // host candidates and never reaches a gateway on another machine.
+    const peer = this.createPeerConnection({ iceServers: connection.iceServers ?? [] });
     const control = peer.createDataChannel('fennec-control', { ordered: true });
     const transceiver = peer.addTransceiver('audio', { direction: 'sendrecv' });
     this.peer = peer;
