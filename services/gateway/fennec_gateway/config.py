@@ -37,6 +37,7 @@ class Tenant:
     consumer_url: str = ""
     consumer_health_url: str = ""
     consumer_token: str = ""
+    public_base_url: str = ""
 
 
 def _read_tenants(raw: str | None) -> tuple[Tenant, ...]:
@@ -48,7 +49,14 @@ def _read_tenants(raw: str | None) -> tuple[Tenant, ...]:
         raise ConfigurationError("FENNEC_TENANTS must be valid JSON") from error
     if not isinstance(entries, list) or not entries:
         raise ConfigurationError("FENNEC_TENANTS must be a non-empty JSON array")
-    known = {"id", "service_token", "consumer_url", "consumer_health_url", "consumer_token"}
+    known = {
+        "id",
+        "service_token",
+        "consumer_url",
+        "consumer_health_url",
+        "consumer_token",
+        "public_base_url",
+    }
     tenants: list[Tenant] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -65,6 +73,7 @@ def _read_tenants(raw: str | None) -> tuple[Tenant, ...]:
                 consumer_url=str(entry.get("consumer_url", "")).strip(),
                 consumer_health_url=str(entry.get("consumer_health_url", "")).strip(),
                 consumer_token=str(entry.get("consumer_token", "")),
+                public_base_url=str(entry.get("public_base_url", "")).strip().rstrip("/"),
             )
         )
     return tuple(tenants)
@@ -172,6 +181,15 @@ class Settings:
                 )
             if tenant.service_token in tokens:
                 raise ConfigurationError("FENNEC_TENANTS service tokens must be unique")
+            # Each tenant's browser is served from its own origin, and the gateway sends
+            # no CORS headers, so a tenant on a different hostname needs its own base URL
+            # or its signaling POST never leaves the browser.
+            if tenant.public_base_url and not tenant.public_base_url.startswith(
+                ("http://", "https://")
+            ):
+                raise ConfigurationError(
+                    f"tenant {tenant.id!r} public_base_url must use http:// or https://"
+                )
             ids.add(tenant.id)
             tokens.add(tenant.service_token)
 
@@ -187,6 +205,7 @@ class Settings:
                 consumer_url=self.consumer_url,
                 consumer_health_url=self.consumer_health_url,
                 consumer_token=self.consumer_token,
+                public_base_url=self.public_base_url,
             ),
         )
 

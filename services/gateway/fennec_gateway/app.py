@@ -168,8 +168,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return tenant
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="invalid service credential")
 
-    def create_client_session() -> tuple[ClientSession, RTCConfiguration | None]:
+    def create_client_session(tenant: Tenant) -> tuple[ClientSession, RTCConfiguration | None]:
         session_id = secrets.token_urlsafe(18)
+        # The browser posts its offer to this URL from the tenant's own page, and the
+        # gateway sends no CORS headers, so the origin has to be the tenant's own.
+        base_url = tenant.public_base_url or resolved.public_base_url
         issued = issue_session_token(
             session_id=session_id,
             secret=resolved.session_secret,
@@ -178,8 +181,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         rtc_configuration, ice_servers = issue_ice_servers(session_id)
         client_session = ClientSession(
             session_id=session_id,
-            signaling_url=f"{resolved.public_base_url}/v1/sessions/{session_id}/offer",
-            candidates_url=f"{resolved.public_base_url}/v1/sessions/{session_id}/candidates",
+            signaling_url=f"{base_url}/v1/sessions/{session_id}/offer",
+            candidates_url=f"{base_url}/v1/sessions/{session_id}/candidates",
             access_token=issued.value,
             expires_at=issued.expires_at,
             ice_servers=ice_servers,
@@ -208,7 +211,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail="requested speech models could not be prepared",
                 ) from error
-        client_session, rtc_configuration = create_client_session()
+        client_session, rtc_configuration = create_client_session(tenant)
         try:
             await registry.create(
                 session_id=client_session.session_id,

@@ -153,6 +153,41 @@ def test_tenants_must_be_distinguishable_and_carry_their_own_consumer() -> None:
         )
 
 
+def test_a_tenant_may_carry_its_own_browser_origin() -> None:
+    settings = Settings(
+        service_token="",
+        session_secret="x" * 32,
+        public_base_url="https://gateway.test",
+        conversation_enabled=True,
+        tenants=(
+            Tenant(
+                id="dex",
+                service_token="d" * 24,
+                consumer_url="http://dex.internal/v1/turns",
+                consumer_token="D" * 24,
+                public_base_url="https://dex.test/fennec",
+            ),
+            Tenant(
+                id="teamx",
+                service_token="t" * 24,
+                consumer_url="http://teamx.internal/v1/turns",
+                consumer_token="T" * 24,
+            ),
+        ),
+    )
+
+    assert settings.resolved_tenants[0].public_base_url == "https://dex.test/fennec"
+    # Unset means the gateway-wide origin, which is what one-hostname deployments want.
+    assert settings.resolved_tenants[1].public_base_url == ""
+
+    with pytest.raises(ConfigurationError, match="tenant 'dex' public_base_url"):
+        Settings(
+            service_token="",
+            session_secret="x" * 32,
+            tenants=(Tenant(id="dex", service_token="d" * 24, public_base_url="dex.test"),),
+        )
+
+
 def test_tenant_json_is_parsed_strictly() -> None:
     assert _read_tenants(None) == ()
     assert _read_tenants("   ") == ()
@@ -168,6 +203,10 @@ def test_tenant_json_is_parsed_strictly() -> None:
 
     with pytest.raises(ConfigurationError, match="needs id and service_token"):
         _read_tenants('[{"id": "dex"}]')
+
+    assert _read_tenants(
+        '[{"id": "dex", "service_token": "d", "public_base_url": "https://dex.test/fennec/"}]'
+    ) == (Tenant(id="dex", service_token="d", public_base_url="https://dex.test/fennec"),)
 
     with pytest.raises(ConfigurationError, match="unknown FENNEC_TENANTS keys: callback_url"):
         _read_tenants('[{"id": "dex", "service_token": "d", "callback_url": "http://evil.test"}]')

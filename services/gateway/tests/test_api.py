@@ -237,7 +237,12 @@ MULTI_TENANT_SETTINGS = Settings(
     session_secret="test-session-secret-at-least-32-characters-long",
     public_base_url="http://gateway.test",
     tenants=(
-        Tenant(id="dex", service_token=DEX_TOKEN, consumer_url="http://dex.internal/v1/turns"),
+        Tenant(
+            id="dex",
+            service_token=DEX_TOKEN,
+            consumer_url="http://dex.internal/v1/turns",
+            public_base_url="https://dex.test/fennec",
+        ),
         Tenant(id="teamx", service_token=TEAMX_TOKEN, consumer_url="http://teamx.internal/v1/turns"),
     ),
 )
@@ -283,3 +288,21 @@ async def test_a_client_label_cannot_choose_the_tenant_it_is_delivered_to() -> N
         response.json()["session_id"], now=datetime.now(timezone.utc)
     )
     assert session.tenant_id == "dex"
+
+
+async def test_a_tenant_signals_on_its_own_origin() -> None:
+    # Each tenant's browser posts its offer from that tenant's own page, and the gateway
+    # sends no CORS headers, so a shared origin would fail preflight for everyone but one.
+    app = create_app(MULTI_TENANT_SETTINGS)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        dex = await client.post("/v1/sessions", headers={"Authorization": f"Bearer {DEX_TOKEN}"}, json={})
+        teamx = await client.post(
+            "/v1/sessions",
+            headers={"Authorization": f"Bearer {TEAMX_TOKEN}"},
+            json={},
+        )
+
+    assert dex.json()["signaling_url"].startswith("https://dex.test/fennec/v1/sessions/")
+    assert dex.json()["candidates_url"].startswith("https://dex.test/fennec/v1/sessions/")
+    # TeamX names no origin of its own, so it keeps the gateway-wide one.
+    assert teamx.json()["signaling_url"].startswith("http://gateway.test/v1/sessions/")

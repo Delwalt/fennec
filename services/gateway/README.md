@@ -223,12 +223,19 @@ gateway at a host of its choosing.
 
 ```bash
 export FENNEC_TENANTS='[
-  {"id": "dex",   "service_token": "...", "consumer_url": "http://dex.internal/v1/turns",   "consumer_token": "..."},
-  {"id": "teamx", "service_token": "...", "consumer_url": "http://teamx.internal/v1/turns", "consumer_token": "..."}
+  {"id": "dex",   "service_token": "...", "consumer_url": "http://dex.internal/v1/turns",
+   "consumer_token": "...", "public_base_url": "https://dex.example/fennec"},
+  {"id": "teamx", "service_token": "...", "consumer_url": "http://teamx.internal/v1/turns",
+   "consumer_token": "...", "public_base_url": "https://teamx.example/fennec"}
 ]'
 ```
 
-Each entry may also carry `consumer_health_url`. Setting `FENNEC_TENANTS`
+Each entry may also carry `consumer_health_url` and `public_base_url`. Give a tenant
+its own `public_base_url` when its browser is served from its own hostname: the
+signaling URL handed to that browser is built from it, the gateway sends no CORS
+headers, and a shared origin would fail preflight for every tenant but one. Unset,
+a tenant falls back to the gateway-wide `FENNEC_PUBLIC_BASE_URL`, which is what a
+one-hostname deployment wants. Setting `FENNEC_TENANTS`
 replaces `FENNEC_SERVICE_TOKEN`, `FENNEC_CONSUMER_URL`,
 `FENNEC_CONSUMER_HEALTH_URL`, and `FENNEC_CONSUMER_TOKEN`; leave it unset and
 those four describe a single implicit tenant, which is what a one-application
