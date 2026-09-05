@@ -63,7 +63,10 @@ class WebRTCTransport implements VoiceTransport {
   private disposePromise: Promise<void> | undefined;
 
   constructor(options: WebRTCTransportOptions) {
-    this.fetch = options.fetch ?? fetch;
+    // Bound to the global. Held on the instance, `this.fetch(...)` would call it with the
+    // transport as its receiver, and a browser rejects that with "Failed to execute
+    // 'fetch' on 'Window': Illegal invocation".
+    this.fetch = (options.fetch ?? fetch).bind(globalThis);
     this.createPeerConnection = options.createPeerConnection ?? (() => new RTCPeerConnection());
     this.createAudioElement =
       options.createAudioElement ??

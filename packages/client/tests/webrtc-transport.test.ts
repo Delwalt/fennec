@@ -17,6 +17,27 @@ describe('direct WebRTC transport', () => {
     });
   });
 
+  it('calls fetch without making it a method of the transport', async () => {
+    // A browser's fetch throws "Illegal invocation" when its receiver is anything but the
+    // window, so the transport must never invoke it as one of its own methods.
+    const receivers: unknown[] = [];
+    const transport = createWebRTCTransport({
+      fetch: function (this: unknown) {
+        receivers.push(this);
+        return Promise.resolve(Response.json({ type: 'answer', sdp: 'answer-sdp' }));
+      },
+      createPeerConnection: () => new FakePeerConnection() as unknown as RTCPeerConnection,
+    });
+
+    await transport.connect({
+      connectionUrl: 'https://fennec.test/offer',
+      accessToken: 'voice-token',
+    });
+
+    expect(receivers).toHaveLength(1);
+    expect(receivers[0]).toBe(globalThis);
+  });
+
   it('signals directly and builds final user and assistant transcripts', async () => {
     const peer = new FakePeerConnection();
     const fetch = vi.fn(async () => Response.json({ type: 'answer', sdp: 'answer-sdp' }));
