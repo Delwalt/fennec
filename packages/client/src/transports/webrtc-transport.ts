@@ -35,7 +35,9 @@ export type FennecMicrophoneProcessing = {
 export function toFennecConnection(session: FennecClientSession): FennecConnection {
   return {
     connectionUrl: session.signalingUrl,
-    candidatesUrl: session.candidatesUrl,
+    // Omitted rather than undefined: exactOptionalPropertyTypes tells them apart, and a
+    // gateway that offers no candidates endpoint should read as not having one.
+    ...(session.candidatesUrl ? { candidatesUrl: session.candidatesUrl } : {}),
     accessToken: session.accessToken,
     iceServers: session.iceServers ?? [],
   };
