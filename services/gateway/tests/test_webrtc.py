@@ -66,9 +66,12 @@ async def test_direct_peer_exchanges_microphone_audio_assistant_audio_and_contro
 
         await wait_until(lambda: control.readyState == "open")
         control.send('{"type":"audio.check"}')
+        control.send('{"type":"microphone.settings","echo_cancellation":true}')
         await wait_until(lambda: received_audio_frames >= 3)
         await wait_until(lambda: session.microphone_frames >= 3)
         await wait_until(lambda: any("audio.check.started" in event for event in control_events))
+        # Negotiated microphone settings are reported, not answered with an error.
+        assert not any("unknown_message_type" in event for event in control_events)
     finally:
         await session.close()
         await client.close()

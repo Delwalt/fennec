@@ -148,6 +148,14 @@ kills the HTTP request to your backend, and bins any audio still in flight from
 the reply it just cancelled. That last part is what makes interrupting feel like
 interrupting a person instead of waiting for a robot to finish.
 
+On speakers, some of that reply comes back through your microphone, and cutting
+a reply off because Fennec heard itself is worse than not being interruptible at
+all. So while audio is actually playing, speech has to clear a margin over the
+room's measured noise floor before it counts as you. Speech that never clears it
+isn't thrown away — it waits, gets transcribed, and is answered after the reply
+finishes, unless it turns out to match what Fennec just said, in which case it is
+dropped and your backend never hears it.
+
 Credentials never reach the browser. Your backend talks to the gateway with one
 token, the gateway talks back with another, and the browser only ever gets a
 two-minute token good for a single session. No audio is stored anywhere.

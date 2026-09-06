@@ -75,7 +75,14 @@ class BargeInDetector:
         self.calls += 1
         if self.calls == 1:
             return TurnDetection(finalized_audio=bytes(6_400))
-        return TurnDetection(speech_started=True)
+        return TurnDetection(
+            speech_started=True,
+            candidate_active=True,
+            candidate_evaluated=True,
+            speech_duration_ms=200,
+            speech_level_dbfs=-20,
+            recent_speech_level_dbfs=-20,
+        )
 
     def reset(self) -> None:
         pass
@@ -174,6 +181,64 @@ class ConfigurableSpeech(FakeSpeech):
     ) -> bytes:
         self.synthesis_configuration.append((model, voice))
         return await super().synthesize(text)
+
+
+class SequenceDetector:
+    def __init__(self, detections: list[TurnDetection]) -> None:
+        self._detections = iter(detections)
+
+    def feed(self, _: bytes) -> TurnDetection:
+        return next(self._detections, TurnDetection())
+
+    def reset(self) -> None:
+        pass
+
+
+def candidate(*, level_dbfs: float, started: bool = False) -> TurnDetection:
+    return TurnDetection(
+        speech_started=started,
+        candidate_active=True,
+        candidate_evaluated=True,
+        speech_duration_ms=200,
+        speech_level_dbfs=level_dbfs,
+        recent_speech_level_dbfs=level_dbfs,
+    )
+
+
+def finalized_candidate(*, level_dbfs: float) -> TurnDetection:
+    return TurnDetection(
+        candidate_evaluated=True,
+        speech_duration_ms=300,
+        speech_level_dbfs=level_dbfs,
+        recent_speech_level_dbfs=level_dbfs,
+        finalized_audio=bytes(6_400),
+    )
+
+
+class EchoSpeech(FakeSpeech):
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        if self.transcriptions == 1:
+            return "Check the server."
+        return "The server is healthy and ready."
+
+
+class EchoConsumer(RecordingConsumer):
+    async def respond(self, turn: FinalizedTurn) -> AsyncIterator[str]:
+        self.turns.append(turn)
+        yield "The server is healthy and ready."
+
+
+class LongAudioSpeech(FakeSpeech):
+    async def synthesize(self, text: str) -> bytes:
+        self.synthesized.append(text)
+        output = BytesIO()
+        with wave.open(output, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24_000)
+            wav.writeframes(bytes(96_000))
+        return output.getvalue()
 
 
 async def wait_for_event(events: list[tuple[str, dict]], event_type: str) -> None:
@@ -345,6 +410,136 @@ async def test_new_user_speech_cancels_the_active_generation_immediately() -> No
     summaries = [data for event, data in events if event == "telemetry.session.summary"]
     assert summaries[0]["interruptions"] == 1
     assert summaries[0]["latency_ms"]["interruption_cancel_ms"]["count"] == 1
+
+
+async def test_quiet_echo_is_deferred_and_ignored_without_cancelling() -> None:
+    events: list[tuple[str, dict]] = []
+    speech = EchoSpeech()
+    consumer = EchoConsumer()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-55, started=True),
+        finalized_candidate(level_dbfs=-55),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    session.feed_audio(bytes(640))
+
+    async with asyncio.timeout(3):
+        while not any(
+            event == "turn.ignored" and data.get("reason") == "assistant_echo"
+            for event, data in events
+        ):
+            await asyncio.sleep(0.01)
+
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+    assert [turn.text for turn in consumer.turns] == ["Check the server."]
+    assert speech.transcriptions == 2
+
+    await session.close()
+    output.stop()
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["echo_candidates_deferred"] == 1
+    assert summary["assistant_echo_turns"] == 1
+    assert summary["possible_false_interruptions"] == 0
+
+
+async def test_pending_candidate_can_strengthen_and_cancel_without_losing_its_turn() -> None:
+    events: list[tuple[str, dict]] = []
+    speech = FakeSpeech()
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-55, started=True),
+        candidate(level_dbfs=-30),
+        finalized_candidate(level_dbfs=-30),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await asyncio.sleep(0)
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+    session.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while speech.transcriptions < 2:
+            await asyncio.sleep(0.01)
+
+    assert [event for event, _ in events].count("speech.started") == 1
+    assert speech.transcriptions == 2
+    assert len(consumer.turns) == 2
+
+    await session.close()
+    output.stop()
+
+
+async def test_confirmed_interruption_drops_deferred_echo_before_queue_backpressure() -> None:
+    events: list[tuple[str, dict]] = []
+    speech = LongAudioSpeech()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-55, started=True),
+        finalized_candidate(level_dbfs=-55),
+        candidate(level_dbfs=-55, started=True),
+        finalized_candidate(level_dbfs=-55),
+        candidate(level_dbfs=-25, started=True),
+        finalized_candidate(level_dbfs=-25),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+        turn_queue_size=1,
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    for _ in range(4):
+        session.feed_audio(bytes(640))
+    await asyncio.sleep(0.05)
+
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+    session.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while speech.transcriptions < 2:
+            await asyncio.sleep(0.01)
+
+    assert not any(
+        event == "error" and data.get("code") in {"turn_backpressure", "turn_detection_failed"}
+        for event, data in events
+    )
+    await session.close()
+    output.stop()
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["dropped_unconfirmed_turns"] == {
+        "capacity": 1,
+        "generation_cancelled": 1,
+    }
 
 
 async def test_empty_turn_after_interruption_is_counted_as_a_possible_false_interruption() -> None:

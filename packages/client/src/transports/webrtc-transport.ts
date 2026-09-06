@@ -363,6 +363,25 @@ class WebRTCTransport implements VoiceTransport {
     this.stopMicrophoneTracks();
     this.microphoneStream = stream;
     this.selectedMicrophoneId = track.getSettings().deviceId ?? deviceId;
+    this.reportMicrophoneProcessing(track);
+  }
+
+  /** Reports what the browser actually negotiated, so a session whose echo cancellation
+   *  never engaged is visible in gateway logs. A field the browser omits stays null:
+   *  unknown, not disabled. Device identifiers are deliberately left out. */
+  private reportMicrophoneProcessing(track: MediaStreamTrack): void {
+    if (this.control?.readyState !== 'open') return;
+    const settings = track.getSettings();
+    try {
+      this.control.send(JSON.stringify({
+        type: 'microphone.settings',
+        echo_cancellation: settings.echoCancellation ?? null,
+        noise_suppression: settings.noiseSuppression ?? null,
+        auto_gain_control: settings.autoGainControl ?? null,
+      }));
+    } catch {
+      // Telemetry must never cost the caller its microphone.
+    }
   }
 
   private tryAudioPlayback(): void {

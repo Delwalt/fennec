@@ -159,6 +159,16 @@ class VoiceSession:
                 if self.audio_track is not None:
                     self.audio_track.trigger()
                 channel.send(_event("audio.check.started"))
+            elif message_type == "microphone.settings":
+                # Three booleans or null; the client never sends device identifiers.
+                logger.info(
+                    "microphone settings session_id=%s echo_cancellation=%s "
+                    "noise_suppression=%s auto_gain_control=%s",
+                    self.session_id,
+                    payload.get("echo_cancellation"),
+                    payload.get("noise_suppression"),
+                    payload.get("auto_gain_control"),
+                )
             elif message_type == "ping":
                 channel.send(_event("pong"))
             elif message_type == "session.close":

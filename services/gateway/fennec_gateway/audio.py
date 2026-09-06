@@ -11,17 +11,25 @@ import numpy as np
 SILENT_DBFS = -120.0
 
 
+def rms_power(pcm: bytes) -> float:
+    """Mean-square power of PCM16 mono audio normalized to full scale."""
+    if len(pcm) < 2:
+        return 0.0
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32_768.0
+    return float(np.mean(np.square(samples)))
+
+
+def power_dbfs(power: float) -> float:
+    return round(10 * log10(power), 1) if power > 0 else SILENT_DBFS
+
+
 def rms_dbfs(pcm: bytes) -> float:
-    """Loudness of one PCM16 frame, so a barge-in can be told apart from echo.
+    """Loudness of PCM16 mono audio relative to digital full scale.
 
     Residual echo that survives browser AEC arrives far quieter than the person
     in front of the microphone; the level is the only signal that separates them.
     """
-    if len(pcm) < 2:
-        return SILENT_DBFS
-    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32_768.0
-    rms = float(np.sqrt(np.mean(np.square(samples))))
-    return round(20 * log10(rms), 1) if rms > 0 else SILENT_DBFS
+    return power_dbfs(rms_power(pcm))
 
 
 def pcm16_mono_wav(pcm: bytes, *, sample_rate: int = 16_000) -> bytes:

@@ -3,19 +3,21 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 import json
 import logging
+import re
 import secrets
 from time import monotonic
 from typing import Any
 
-from .audio import decode_audio_to_pcm16_mono, rms_dbfs
+from .audio import decode_audio_to_pcm16_mono, power_dbfs, rms_power
 from .config import DEFAULT_TENANT_ID
 from .media import AssistantAudioTrack
 from .providers import ConsumerProvider, FinalizedTurn, ProviderError, SpeechProvider
 from .session_configuration import VoiceConfiguration
 from .telemetry import SessionTelemetry
-from .turns import SileroTurnDetector
+from .turns import SileroTurnDetector, TurnDetection
 
 
 logger = logging.getLogger("fennec.gateway")
@@ -25,6 +27,15 @@ MAX_WARM_RETRY_SECONDS = 60
 # ponytail: fixed allowance for the browser's jitter buffer. A real playout
 # estimate would need RTCP receiver reports read back from the peer connection.
 PLAYBACK_TAIL_SECONDS = 0.25
+BARGE_IN_MARGIN_DB = 10.0
+INITIAL_NOISE_FLOOR_DBFS = -60.0
+NOISE_FLOOR_RISE_ALPHA = 0.01
+NOISE_FLOOR_FALL_ALPHA = 0.1
+NOISE_FLOOR_MAX_RISE_DB = 6.0
+ECHO_TEXT_CHARACTERS = 8_192
+MIN_ECHO_TOKENS = 4
+ECHO_TOKEN_COVERAGE = 0.8
+TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
 
 
 class AudioBackpressureError(RuntimeError):
@@ -37,6 +48,9 @@ class FinalizedAudio:
     forced_by_limit: bool
     speech_end_delay_ms: float
     detected_at: float
+    confirmed: bool = True
+    echo_generation_id: str | None = None
+    cancelled_generation_id: str | None = None
 
 
 class ConversationSession:
@@ -55,6 +69,8 @@ class ConversationSession:
         max_continuation_characters: int = 8_192,
         configuration: VoiceConfiguration | None = None,
     ) -> None:
+        if turn_queue_size < 1:
+            raise ValueError("turn_queue_size must be at least one")
         self._session_id = session_id
         self._speech = speech
         self._consumer = consumer
@@ -73,10 +89,18 @@ class ConversationSession:
         self._generation_task: asyncio.Task[None] | None = None
         self._generation_id: str | None = None
         self._assistant_active = False
+        self._echo_generation_id: str | None = None
+        self._echo_risk_until: float | None = None
+        self._echo_text: dict[str, str] = {}
+        self._echo_context_limit = max(8, turn_queue_size + 2)
+        self._noise_floor_power = 10 ** (INITIAL_NOISE_FLOOR_DBFS / 10)
+        self._candidate_started_at: float | None = None
+        self._candidate_confirmed = False
+        self._candidate_echo_generation_id: str | None = None
+        self._candidate_cancelled_generation_id: str | None = None
         self._continuations_requested = 0
         self._continued_text: list[str] = []
         self._telemetry = SessionTelemetry()
-        self._pending_interruption = False
         self._closed = False
 
     def feed_audio(self, pcm: bytes) -> None:
@@ -102,6 +126,10 @@ class ConversationSession:
         )
         await self._cancel_generation(reason="session_closed", notify=False)
         self._detector.reset()
+        self._reset_candidate_state()
+        self._echo_text.clear()
+        self._echo_generation_id = None
+        self._echo_risk_until = None
         self._clear_audio_queue()
         self._clear_turn_queue()
         summary = self._telemetry.summary(
@@ -121,49 +149,162 @@ class ConversationSession:
                 pcm = await self._audio_queue.get()
                 fed_at = monotonic()
                 detection = await asyncio.to_thread(self._detector.feed, pcm)
-                self._telemetry.timing("vad_feed_ms", (monotonic() - fed_at) * 1_000)
-                if detection.speech_started:
-                    confirmed_at = monotonic()
-                    level_dbfs = rms_dbfs(pcm)
-                    self._emit("speech.started", level_dbfs=level_dbfs)
-                    if self._assistant_active:
-                        self._pending_interruption = True
-                        await self._cancel_generation(
-                            reason="user_speech",
-                            notify=True,
-                            confirmed_at=confirmed_at,
-                            level_dbfs=level_dbfs,
-                        )
-                    elif (
-                        self._generation_task is not None
-                        and not self._generation_task.done()
-                    ) or not self._turn_queue.empty():
-                        self._continuations_requested += 1
-                    self._emit("state.changed", state="listening")
+                observed_at = monotonic()
+                self._telemetry.timing("vad_feed_ms", (observed_at - fed_at) * 1_000)
+                self._observe_noise_floor(
+                    pcm,
+                    candidate_active=detection.candidate_active or detection.speech_started,
+                )
+                await self._apply_candidate_evidence(detection, observed_at=observed_at)
                 if detection.finalized_audio is not None:
-                    try:
-                        self._turn_queue.put_nowait(
-                            FinalizedAudio(
-                                pcm=detection.finalized_audio,
-                                forced_by_limit=detection.forced_by_limit,
-                                speech_end_delay_ms=detection.speech_end_delay_ms,
-                                detected_at=monotonic(),
-                            )
-                        )
-                    except asyncio.QueueFull as error:
-                        self._emit(
-                            "error",
-                            code="turn_backpressure",
-                            component="transcription",
-                        )
-                        raise AudioBackpressureError(
-                            "finalized turn queue reached its limit"
-                        ) from error
+                    tracked_candidate = self._candidate_started_at is not None
+                    finalized = FinalizedAudio(
+                        pcm=detection.finalized_audio,
+                        forced_by_limit=detection.forced_by_limit,
+                        speech_end_delay_ms=detection.speech_end_delay_ms,
+                        detected_at=monotonic(),
+                        # Scripted adapters and older detector fakes can finalize a complete
+                        # turn without first reporting its candidate transition.
+                        confirmed=self._candidate_confirmed or not tracked_candidate,
+                        echo_generation_id=self._candidate_echo_generation_id,
+                        cancelled_generation_id=self._candidate_cancelled_generation_id,
+                    )
+                    self._reset_candidate_state()
+                    self._enqueue_finalized(finalized)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("audio worker failed session_id=%s", self._session_id)
             self._emit("error", code="turn_detection_failed", component="turn_detection")
+
+    async def _apply_candidate_evidence(
+        self,
+        detection: TurnDetection,
+        *,
+        observed_at: float,
+    ) -> None:
+        if detection.speech_started and self._candidate_started_at is None:
+            self._candidate_started_at = observed_at - detection.speech_duration_ms / 1_000
+            self._candidate_echo_generation_id = self._active_echo_generation(observed_at)
+            if self._candidate_echo_generation_id is not None:
+                self._telemetry.echo_candidates_deferred += 1
+
+        if self._candidate_started_at is None or self._candidate_confirmed:
+            return
+        if self._candidate_echo_generation_id is None:
+            await self._confirm_candidate(detection, confirmed_at=observed_at)
+            return
+        if not detection.candidate_evaluated:
+            return
+
+        level_dbfs = max(
+            detection.recent_speech_level_dbfs,
+            detection.speech_level_dbfs,
+        )
+        noise_floor_dbfs = power_dbfs(self._noise_floor_power)
+        margin_db = level_dbfs - noise_floor_dbfs
+        self._telemetry.measurement("echo_candidate_level_dbfs", level_dbfs)
+        self._telemetry.measurement("echo_candidate_margin_db", margin_db)
+        if margin_db >= BARGE_IN_MARGIN_DB:
+            self._telemetry.echo_candidates_confirmed += 1
+            await self._confirm_candidate(detection, confirmed_at=observed_at)
+
+    async def _confirm_candidate(
+        self,
+        detection: TurnDetection,
+        *,
+        confirmed_at: float,
+    ) -> None:
+        if self._candidate_confirmed:
+            return
+        self._candidate_confirmed = True
+        confirmation_ms = 0.0
+        if self._candidate_started_at is not None:
+            confirmation_ms = (confirmed_at - self._candidate_started_at) * 1_000
+            self._telemetry.timing("candidate_confirmation_ms", confirmation_ms)
+        level_dbfs = max(
+            detection.recent_speech_level_dbfs,
+            detection.speech_level_dbfs,
+        )
+        noise_floor_dbfs = power_dbfs(self._noise_floor_power)
+        self._emit(
+            "speech.started",
+            level_dbfs=level_dbfs,
+            noise_floor_dbfs=noise_floor_dbfs,
+            confirmation_ms=round(confirmation_ms, 1),
+        )
+        if self._assistant_active:
+            # Purge before awaiting the cancellation: that await lets the turn
+            # worker resume and pull the stale echo turn out of the queue.
+            if self._generation_id is not None:
+                self._drop_unconfirmed_for_generation(self._generation_id)
+            self._candidate_cancelled_generation_id = await self._cancel_generation(
+                reason="user_speech",
+                notify=True,
+                confirmed_at=confirmed_at,
+                level_dbfs=level_dbfs,
+            )
+        elif (
+            self._generation_task is not None
+            and not self._generation_task.done()
+        ) or not self._turn_queue.empty():
+            self._continuations_requested += 1
+        self._emit("state.changed", state="listening")
+
+    def _observe_noise_floor(self, pcm: bytes, *, candidate_active: bool) -> None:
+        if candidate_active or self._active_echo_generation() is not None:
+            return
+        observed = rms_power(pcm)
+        max_rise = self._noise_floor_power * 10 ** (NOISE_FLOOR_MAX_RISE_DB / 10)
+        bounded = min(observed, max_rise)
+        alpha = (
+            NOISE_FLOOR_FALL_ALPHA
+            if bounded < self._noise_floor_power
+            else NOISE_FLOOR_RISE_ALPHA
+        )
+        initial_floor = 10 ** (INITIAL_NOISE_FLOOR_DBFS / 10)
+        self._noise_floor_power = max(
+            initial_floor,
+            self._noise_floor_power + alpha * (bounded - self._noise_floor_power),
+        )
+
+    def _enqueue_finalized(self, finalized: FinalizedAudio) -> None:
+        try:
+            self._turn_queue.put_nowait(finalized)
+        except asyncio.QueueFull as error:
+            if not finalized.confirmed:
+                self._telemetry.dropped_unconfirmed_capacity += 1
+                return
+            self._emit(
+                "error",
+                code="turn_backpressure",
+                component="transcription",
+            )
+            raise AudioBackpressureError(
+                "finalized turn queue reached its limit"
+            ) from error
+
+    def _drop_unconfirmed_for_generation(self, generation_id: str) -> None:
+        retained: list[FinalizedAudio] = []
+        dropped = 0
+        while True:
+            try:
+                candidate = self._turn_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not candidate.confirmed and candidate.echo_generation_id == generation_id:
+                dropped += 1
+            else:
+                retained.append(candidate)
+        for candidate in retained:
+            self._turn_queue.put_nowait(candidate)
+        self._telemetry.dropped_unconfirmed_generation_cancelled += dropped
+
+    def _reset_candidate_state(self) -> None:
+        self._candidate_started_at = None
+        self._candidate_confirmed = False
+        self._candidate_echo_generation_id = None
+        self._candidate_cancelled_generation_id = None
 
     async def _run_turn_worker(self) -> None:
         try:
@@ -216,6 +357,17 @@ class ConversationSession:
                     language=self._configuration.speech_language,
                 )
             transcript_at = monotonic()
+            if finalized.echo_generation_id is not None:
+                assistant_text = self._echo_text.get(finalized.echo_generation_id)
+                if assistant_text is None:
+                    self._telemetry.echo_reference_misses += 1
+                elif _is_assistant_echo(text, assistant_text):
+                    self._telemetry.assistant_echo_turns += 1
+                    if finalized.cancelled_generation_id is not None:
+                        self._telemetry.possible_false_interruptions += 1
+                    self._emit("turn.ignored", turn_id=turn_id, reason="assistant_echo")
+                    self._emit("state.changed", state="listening")
+                    return
             if self._continuations_requested:
                 self._continuations_requested -= 1
                 self._append_continued_text(text)
@@ -227,16 +379,16 @@ class ConversationSession:
             self._continued_text.clear()
             if not combined_text:
                 self._telemetry.empty_transcripts += 1
-                if self._pending_interruption:
+                if not finalized.confirmed:
+                    self._telemetry.empty_unconfirmed_candidates += 1
+                if finalized.cancelled_generation_id is not None:
                     self._telemetry.possible_false_interruptions += 1
-                self._pending_interruption = False
                 self._emit("turn.ignored", turn_id=turn_id, reason="empty_transcript")
                 self._emit("state.changed", state="listening")
                 return
 
             transcript_latency_ms = (transcript_at - speech_ended_at) * 1_000
             self._telemetry.timing("transcript_final_ms", transcript_latency_ms)
-            self._pending_interruption = False
             self._emit(
                 "transcript.final",
                 turn_id=turn_id,
@@ -268,6 +420,7 @@ class ConversationSession:
                     generation_id=generation_id,
                     text=phrase,
                 )
+                self._remember_assistant_text(generation_id, phrase)
                 if self._configuration is None:
                     wav = await self._speech.synthesize(phrase)
                 else:
@@ -292,6 +445,7 @@ class ConversationSession:
                 if first_audio:
                     first_audio = False
                     queued_at = monotonic()
+                    self._begin_echo_risk(generation_id)
                     self._report_first_audio(
                         turn_id=turn_id,
                         generation_id=generation_id,
@@ -324,15 +478,18 @@ class ConversationSession:
             # idle mid-sentence, so Fennec's own tail arrived as a fresh user
             # turn instead of a barge-in against a still-speaking assistant.
             await asyncio.sleep(self._output.queued_seconds + PLAYBACK_TAIL_SECONDS)
+            self._clear_echo_risk(generation_id)
             self._emit("assistant.done", generation_id=generation_id)
             self._telemetry.generations_completed += 1
             self._emit("state.changed", state="listening")
         except asyncio.CancelledError:
             self._output.cancel_generation(generation_id)
+            self._end_echo_risk(generation_id)
             raise
         except ProviderError as error:
             self._telemetry.provider_errors += 1
             self._output.cancel_generation(generation_id)
+            self._end_echo_risk(generation_id)
             logger.warning(
                 "conversation provider failed session_id=%s generation_id=%s error=%s",
                 self._session_id,
@@ -391,12 +548,13 @@ class ConversationSession:
         notify: bool,
         confirmed_at: float | None = None,
         level_dbfs: float | None = None,
-    ) -> None:
+    ) -> str | None:
         generation_id = self._generation_id
         task = self._generation_task
         self._generation_id = None
         if generation_id is not None:
             self._output.cancel_generation(generation_id)
+            self._end_echo_risk(generation_id)
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -416,6 +574,38 @@ class ConversationSession:
                 # is echo the browser's canceller let through, not the user.
                 **({} if level_dbfs is None else {"level_dbfs": level_dbfs}),
             )
+        return generation_id
+
+    def _begin_echo_risk(self, generation_id: str) -> None:
+        self._echo_generation_id = generation_id
+        self._echo_risk_until = None
+
+    def _end_echo_risk(self, generation_id: str) -> None:
+        if generation_id == self._echo_generation_id:
+            self._echo_risk_until = monotonic() + PLAYBACK_TAIL_SECONDS
+
+    def _clear_echo_risk(self, generation_id: str) -> None:
+        if generation_id == self._echo_generation_id:
+            self._echo_generation_id = None
+            self._echo_risk_until = None
+
+    def _active_echo_generation(self, now: float | None = None) -> str | None:
+        if self._echo_generation_id is None:
+            return None
+        current = monotonic() if now is None else now
+        if self._echo_risk_until is not None and current >= self._echo_risk_until:
+            self._echo_generation_id = None
+            self._echo_risk_until = None
+            return None
+        return self._echo_generation_id
+
+    def _remember_assistant_text(self, generation_id: str, text: str) -> None:
+        existing = self._echo_text.get(generation_id, "")
+        self._echo_text[generation_id] = f"{existing}{text}"[-ECHO_TEXT_CHARACTERS:]
+        while len(self._echo_text) > self._echo_context_limit:
+            oldest = next(iter(self._echo_text))
+            self._echo_text.pop(oldest)
+            self._telemetry.echo_reference_evictions += 1
 
     def _emit(self, event_type: str, **data: Any) -> None:
         # Metadata only - never log spoken/spoken-back text content.
@@ -676,6 +866,25 @@ def _phrase_boundary(text: str, *, max_characters: int) -> int | None:
         split = text.rfind(" ", 0, max_characters)
         return split if split > 0 else max_characters
     return None
+
+
+def _is_assistant_echo(transcript: str, assistant_text: str) -> bool:
+    transcript_tokens = TOKEN_PATTERN.findall(transcript.casefold())
+    if len(transcript_tokens) < MIN_ECHO_TOKENS:
+        return False
+    assistant_tokens = TOKEN_PATTERN.findall(assistant_text.casefold())
+    if len(assistant_tokens) < MIN_ECHO_TOKENS:
+        return False
+    match = SequenceMatcher(
+        None,
+        transcript_tokens,
+        assistant_tokens,
+        autojunk=False,
+    ).find_longest_match()
+    return (
+        match.size >= MIN_ECHO_TOKENS
+        and match.size / len(transcript_tokens) >= ECHO_TOKEN_COVERAGE
+    )
 
 
 def _provider_component(error: ProviderError) -> str:

@@ -271,6 +271,96 @@ describe('direct WebRTC transport', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('requests microphone processing by default and reports what the browser negotiated', async () => {
+    const peer = new FakePeerConnection();
+    const track = {
+      kind: 'audio',
+      enabled: true,
+      stop: vi.fn(),
+      getSettings: () => ({
+        deviceId: 'microphone-1',
+        echoCancellation: true,
+        noiseSuppression: false,
+      }),
+    };
+    const stream = {
+      getAudioTracks: () => [track],
+      getTracks: () => [track],
+    };
+    const getUserMedia = vi.fn(async () => stream);
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia } });
+    const transport = createWebRTCTransport({
+      fetch: async () => Response.json({ type: 'answer', sdp: 'answer-sdp' }),
+      createPeerConnection: () => peer as unknown as RTCPeerConnection,
+    });
+
+    try {
+      await transport.connect({
+        connectionUrl: 'https://fennec.test/offer',
+        accessToken: 'voice-token',
+      });
+      await transport.startMicrophone();
+
+      expect(getUserMedia).toHaveBeenCalledWith({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+        video: false,
+      });
+      // A field the browser omits reports as unknown, and no device identifier travels.
+      expect(JSON.parse(peer.control.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'microphone.settings',
+        echo_cancellation: true,
+        noise_suppression: false,
+        auto_gain_control: null,
+      });
+    } finally {
+      await transport.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('reports negotiated settings again when the microphone is replaced', async () => {
+    const peer = new FakePeerConnection();
+    const makeTrack = (echoCancellation: boolean) => ({
+      kind: 'audio',
+      enabled: true,
+      stop: vi.fn(),
+      getSettings: () => ({ deviceId: 'microphone-1', echoCancellation }),
+    });
+    const tracks = [makeTrack(true), makeTrack(false)];
+    const getUserMedia = vi.fn(async () => {
+      const track = tracks.shift() ?? makeTrack(false);
+      return { getAudioTracks: () => [track], getTracks: () => [track] };
+    });
+    vi.stubGlobal('navigator', { mediaDevices: { getUserMedia } });
+    const transport = createWebRTCTransport({
+      fetch: async () => Response.json({ type: 'answer', sdp: 'answer-sdp' }),
+      createPeerConnection: () => peer as unknown as RTCPeerConnection,
+    });
+
+    try {
+      await transport.connect({
+        connectionUrl: 'https://fennec.test/offer',
+        accessToken: 'voice-token',
+      });
+      await transport.startMicrophone();
+      await transport.selectMicrophone('microphone-2');
+
+      const reports = peer.control.send.mock.calls
+        .map((call) => JSON.parse(call[0] as string) as Record<string, unknown>)
+        .filter((event) => event.type === 'microphone.settings');
+      expect(reports.map((event) => event.echo_cancellation)).toEqual([true, false]);
+      expect(getUserMedia).toHaveBeenCalledTimes(2);
+    } finally {
+      await transport.dispose();
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 class FakePeerConnection extends EventTarget {
@@ -307,6 +397,8 @@ class FakePeerConnection extends EventTarget {
 }
 
 class FakeDataChannel extends EventTarget {
+  readyState: RTCDataChannelState = 'open';
+  send = vi.fn();
   close(): void {}
 }
 

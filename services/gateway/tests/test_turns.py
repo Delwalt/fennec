@@ -62,3 +62,22 @@ def test_default_endpoint_keeps_a_one_second_thinking_pause_in_one_turn() -> Non
     events.extend(detector.feed(pcm_chunk(8_000)) for _ in range(12))
     events.extend(detector.feed(pcm_chunk(0)) for _ in range(65))
     assert len([event for event in events if event.finalized_audio is not None]) == 1
+
+
+def test_active_candidate_reports_updated_accumulated_and_recent_evidence() -> None:
+    detector = SileroTurnDetector(timestamp_detector=fake_timestamps)
+
+    first = [detector.feed(pcm_chunk(8_000)) for _ in range(5)][-1]
+    assert first.speech_started is True
+    assert first.candidate_active is True
+    assert first.candidate_evaluated is True
+    assert first.speech_duration_ms == 100
+    assert first.speech_level_dbfs == first.recent_speech_level_dbfs
+
+    second = [detector.feed(pcm_chunk(4_000)) for _ in range(5)][-1]
+    assert second.speech_started is False
+    assert second.candidate_active is True
+    assert second.candidate_evaluated is True
+    assert second.speech_duration_ms == 200
+    assert second.speech_level_dbfs < first.speech_level_dbfs
+    assert second.recent_speech_level_dbfs < first.recent_speech_level_dbfs

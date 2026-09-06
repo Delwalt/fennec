@@ -16,6 +16,7 @@ It provides:
 - phrase-bounded synthesis through local Kokoro;
 - generation-aware cancellation and stale-audio rejection;
 - confirmed-speech barge-in that aborts the active consumer and TTS work;
+- a noise-floor-relative echo gate and a transcript backstop on the reply's own speech;
 - bounded, text-free session latency and queue telemetry;
 - liveness and speech-model readiness endpoints; and
 - a development-only browser harness.
@@ -148,12 +149,18 @@ returned. Only the authenticated backend API and the development-only harness
 can request overrides; service URLs, credentials, capacity, timeouts, and
 developer switches remain server-owned.
 
-The `fennec-control` data channel accepts `ping`, `audio.check`, and
-`session.close`. It emits `speech.started`, `turn.committed`,
-`transcript.final`, `turn.latency`, `assistant.text.delta`,
-`assistant.speaking`, `assistant.done`, `assistant.cancelled`, `state.changed`,
-and bounded `error` events. There is deliberately no parallel signaling
-WebSocket.
+The `fennec-control` data channel accepts `ping`, `audio.check`,
+`microphone.settings`, and `session.close`. It emits `speech.started`,
+`turn.committed`, `transcript.final`, `turn.ignored`, `turn.deferred`,
+`turn.latency`, `assistant.text.delta`, `assistant.speaking`, `assistant.done`,
+`assistant.cancelled`, `state.changed`, and bounded `error` events. There is
+deliberately no parallel signaling WebSocket.
+
+`microphone.settings` carries the three processing flags the browser actually
+negotiated — `echo_cancellation`, `noise_suppression`, `auto_gain_control` — so a
+session whose echo cancellation never engaged is visible in the logs. A flag the
+browser does not report is `null`: unknown, not disabled. No device identifier is
+accepted or logged.
 
 `assistant.done` and the return to `listening` wait for the queued reply to
 finish playing, not for its last phrase to be enqueued. Enqueuing runs seconds
@@ -183,10 +190,39 @@ endpointing window, so adding it would count the same time twice. It is worth
 watching on its own: a non-trivial value means Silero is running behind the
 microphone rather than the pipeline being slow.
 
-`speech.started` and `assistant.cancelled` carry `level_dbfs`, the loudness of
-the frame that confirmed speech. A barge-in far quieter than a talker in front
-of the microphone is residual echo the browser's canceller let through, not the
-user.
+### Hearing you and not itself
+
+Browser echo cancellation is the first line of defence, but residual speaker
+output still reaches the microphone, and cancelling a reply because Fennec heard
+itself is worse than not being interruptible. So Silero detecting speech starts a
+*candidate*, and only a confirmed candidate cancels anything.
+
+While assistant audio could physically be reaching the microphone — from the
+first queued frame until the queue drains plus `PLAYBACK_TAIL_SECONDS` — a
+candidate must clear `BARGE_IN_MARGIN_DB` over the session's measured noise floor
+before it is confirmed. That estimate is maintained only while no candidate is
+active and no assistant audio is playing, and it rises slowly so the start of
+real speech cannot teach it that the speaker is background noise. Outside that
+window — including while the consumer or TTS is still working, when there is no
+audio to echo — any candidate is confirmed immediately, so a quiet correction
+during a slow reply still interrupts.
+
+An unconfirmed candidate is not discarded. It keeps accumulating and is
+re-evaluated on every Silero tick, so speech that grows louder confirms with its
+onset audio intact. If it never clears the margin it still becomes a turn, and
+the turn worker is serial, so it is answered after the current reply finishes
+rather than lost. Before that turn reaches the consumer its transcript is
+compared against what the assistant actually said during the window it began in;
+a strong overlap is dropped as `turn.ignored` with reason `assistant_echo`, which
+is what stops one false cancellation from becoming a conversation with itself.
+Neither side of that comparison is ever logged.
+
+`turn.ignored` carries `empty_transcript` or `assistant_echo`. `speech.started`
+carries `level_dbfs` and `noise_floor_dbfs` for the confirmed candidate plus
+`confirmation_ms`, the wait between the candidate starting and being confirmed;
+`assistant.cancelled` carries `level_dbfs` and its own `latency_ms`. Those two
+latencies are deliberately separate — a fast cancellation cannot hide a
+slow-feeling barge-in.
 
 On normal session close the channel also emits `telemetry.session.summary`.
 It contains counts, queue peaks, rejected-frame counts, and bounded
@@ -195,6 +231,18 @@ median/p95/max distributions for every `turn.latency` stage plus `vad_feed_ms`
 cancellation. It contains no transcript or audio content. `continued_segments`
 counts speech fragments that arrived while an earlier fragment was still being
 transcribed and were safely joined before dispatch to the consumer.
+
+The summary also reports the echo gate: `echo_candidates_deferred` and
+`echo_candidates_confirmed`, `assistant_echo_turns`,
+`empty_unconfirmed_candidates`, `echo_reference_misses` and
+`echo_reference_evictions` (assistant text aged out before its candidate was
+classified), and `dropped_unconfirmed_turns` split by `capacity` and
+`generation_cancelled`. Unconfirmed candidates are dropped rather than allowed to
+exhaust the turn queue, because backpressure there ends the session; confirmed
+speech keeps the original fatal behaviour. `possible_false_interruptions` counts
+only turns where Fennec actually cancelled a generation and the result was empty
+or was identified as its own echo. A `measurements` block carries the same
+bounded distributions for candidate level and noise-floor margin in dBFS.
 
 ## Turn settings
 
