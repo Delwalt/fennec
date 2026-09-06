@@ -8,7 +8,12 @@ import pytest
 
 from conftest import wait_until
 from fennec_gateway import conversation
-from fennec_gateway.conversation import ConversationRuntime, ConversationSession, response_phrases
+from fennec_gateway.conversation import (
+    ConversationRuntime,
+    ConversationSession,
+    MAX_CONTINUED_SEGMENTS,
+    response_phrases,
+)
 from fennec_gateway.media import AssistantAudioTrack
 from fennec_gateway.providers import FinalizedTurn, ProviderError
 from fennec_gateway.session_configuration import VoiceConfiguration
@@ -153,6 +158,33 @@ class RecordingConsumer(FakeConsumer):
     async def respond(self, turn: FinalizedTurn) -> AsyncIterator[str]:
         self.turns.append(turn)
         yield "I heard both sentences."
+
+
+class RelentlessDetector:
+    """Every feed finalizes a turn, and announces fresh speech first — the shape of someone
+    who never stops talking, which is what starved the continuation chain."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def feed(self, _: bytes) -> TurnDetection:
+        self.calls += 1
+        if self.calls % 2:
+            return TurnDetection(speech_started=True)
+        return TurnDetection(finalized_audio=bytes(6_400))
+
+    def reset(self) -> None:
+        pass
+
+
+class SlowNumberedSpeech(FakeSpeech):
+    """Transcription that takes long enough for the next turn to arrive behind it, which is
+    the condition a continuation is requested under."""
+
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        await asyncio.sleep(0.05)
+        return f"segment {self.transcriptions}"
 
 
 class ConfigurableSpeech(FakeSpeech):
@@ -327,6 +359,80 @@ async def test_speech_after_a_pause_preserves_the_transcript_already_in_flight()
     assert not any(event == "assistant.cancelled" for event, _ in events)
     summaries = [data for event, data in events if event == "telemetry.session.summary"]
     assert summaries[0]["continued_segments"] == 1
+
+
+async def test_a_deferred_turn_leaves_the_session_listening() -> None:
+    # The client reads `transcribing` as thinking. A deferral that never says otherwise
+    # leaves it saying Dex is thinking while the gateway waits for the next word.
+    events: list[tuple[str, dict]] = []
+    speech = CoordinatedSpeech()
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=RecordingConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=ContinuedSpeechDetector(),  # type: ignore[arg-type]
+    )
+
+    conversation.feed_audio(bytes(640))
+    await speech.first_transcription_started.wait()
+    conversation.feed_audio(bytes(640))
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "speech.started")
+    speech.release_first_transcription.set()
+    await wait_for_event(events, "assistant.done")
+    await conversation.close()
+    output.stop()
+
+    ordered = [event for event, _ in events]
+    deferred = ordered.index("turn.deferred")
+    assert ordered[deferred + 1] == "state.changed"
+    assert events[deferred + 1][1]["state"] == "listening"
+
+
+async def test_an_unbroken_talker_still_gets_an_answer() -> None:
+    # Continuations are requested by speech starting and released by a transcription
+    # finishing. Speak steadily enough and the first outruns the second, every turn is
+    # deferred, and the consumer is never asked anything at all.
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=SlowNumberedSpeech(),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=RelentlessDetector(),  # type: ignore[arg-type]
+    )
+
+    # Faster than transcription, so there is always a turn behind the one being transcribed
+    # when the next phrase starts — which is what asks for a continuation.
+    async def keep_talking() -> None:
+        for _ in range(40):
+            try:
+                conversation.feed_audio(bytes(640))
+            except Exception:  # the bounded queue pushing back is itself the speaker pausing
+                pass
+            await asyncio.sleep(0.005)
+
+    talking = asyncio.create_task(keep_talking())
+    try:
+        await wait_until(lambda: bool(consumer.turns), timeout=3.0)
+    finally:
+        talking.cancel()
+        await asyncio.gather(talking, return_exceptions=True)
+    await conversation.close()
+    output.stop()
+
+    # The bound is on the chain, not on the conversation: what was deferred is folded into
+    # the answer rather than dropped.
+    assert consumer.turns, "a turn must reach the consumer however long the speaker runs on"
+    assert "segment 1" in consumer.turns[0].text
+    deferrals = [event for event, _ in events].count("turn.deferred")
+    assert deferrals <= MAX_CONTINUED_SEGMENTS
 
 
 async def test_session_speech_configuration_reaches_stt_and_tts() -> None:

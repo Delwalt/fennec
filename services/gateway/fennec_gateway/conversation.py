@@ -33,6 +33,10 @@ NOISE_FLOOR_RISE_ALPHA = 0.01
 NOISE_FLOOR_FALL_ALPHA = 0.1
 NOISE_FLOOR_MAX_RISE_DB = 6.0
 ECHO_TEXT_CHARACTERS = 8_192
+# How many segments one utterance may be stitched from before it is answered regardless.
+# Three covers a sentence resumed after a breath twice over; beyond that the speaker is
+# owed a reply more than they are owed one more clause.
+MAX_CONTINUED_SEGMENTS = 3
 MIN_ECHO_TOKENS = 4
 ECHO_TOKEN_COVERAGE = 0.8
 TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
@@ -399,15 +403,26 @@ class ConversationSession:
                     self._emit("turn.ignored", turn_id=turn_id, reason=ignored)
                     self._emit("state.changed", state="listening")
                     return
-            if self._continuations_requested:
+            # A continuation folds this turn into the one still in flight. Bounded, because
+            # the request comes from the speaker starting again and the release comes from a
+            # transcription finishing: talk steadily enough and the first outpaces the second
+            # forever, every turn is deferred, and the consumer is never asked anything. Past
+            # the bound the chain is delivered as it stands and the speaker gets an answer.
+            if self._continuations_requested and len(self._continued_text) < MAX_CONTINUED_SEGMENTS:
                 self._continuations_requested -= 1
                 self._append_continued_text(text)
                 self._telemetry.continued_segments += 1
                 self._emit("turn.deferred", turn_id=turn_id, reason="user_continuing")
+                # Without this the session is left in `transcribing`, which the client reads
+                # as thinking. It is listening, and says so — every other early return here
+                # already does.
+                self._emit("state.changed", state="listening")
                 return
 
             combined_text = " ".join((*self._continued_text, text)).strip()
             self._continued_text.clear()
+            # Whatever was outstanding asked for this text to be folded in, and it has been.
+            self._continuations_requested = 0
             if not combined_text:
                 self._telemetry.empty_transcripts += 1
                 if not finalized.confirmed:
