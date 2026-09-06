@@ -81,3 +81,32 @@ def test_active_candidate_reports_updated_accumulated_and_recent_evidence() -> N
     assert second.speech_duration_ms == 200
     assert second.speech_level_dbfs < first.speech_level_dbfs
     assert second.recent_speech_level_dbfs < first.recent_speech_level_dbfs
+
+
+def test_candidate_silero_stops_recognizing_is_abandoned_rather_than_held() -> None:
+    """A hum reads as speech inside the prefix window and stops reading as speech with
+    context around it. Holding that candidate pinned the session on "listening" until
+    the maximum turn length forced a transcription of near-silence."""
+    calls = {"count": 0}
+
+    def only_the_prefix_hears_speech(
+        audio: np.ndarray,
+        options: VadOptions,
+    ) -> list[dict[str, int]]:
+        calls["count"] += 1
+        return fake_timestamps(audio, options) if calls["count"] == 1 else []
+
+    detector = SileroTurnDetector(
+        max_turn_seconds=1,
+        timestamp_detector=only_the_prefix_hears_speech,
+    )
+    events = [detector.feed(pcm_chunk(8_000)) for _ in range(60)]
+
+    assert any(event.speech_started for event in events)
+    assert not any(event.finalized_audio is not None for event in events)
+    assert not events[-1].candidate_active
+
+    # The abandoned candidate leaves nothing behind: real speech still starts a turn.
+    detector = SileroTurnDetector(timestamp_detector=fake_timestamps)
+    restarted = [detector.feed(pcm_chunk(8_000)) for _ in range(6)]
+    assert any(event.speech_started for event in restarted)

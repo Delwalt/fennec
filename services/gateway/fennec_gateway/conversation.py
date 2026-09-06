@@ -183,6 +183,15 @@ class ConversationSession:
         *,
         observed_at: float,
     ) -> None:
+        if (
+            detection.finalized_audio is None
+            and not detection.candidate_active
+            and not detection.speech_started
+        ):
+            # The detector abandoned the candidate, so its context must not outlive it.
+            self._reset_candidate_state()
+            return
+
         if detection.speech_started and self._candidate_started_at is None:
             self._candidate_started_at = observed_at - detection.speech_duration_ms / 1_000
             self._candidate_echo_generation_id = self._active_echo_generation(observed_at)

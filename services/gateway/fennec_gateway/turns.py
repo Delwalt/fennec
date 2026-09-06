@@ -93,7 +93,13 @@ class SileroTurnDetector:
 
         speeches = self._timestamps(self._utterance)
         if not speeches:
-            return TurnDetection(candidate_active=True, candidate_evaluated=True)
+            # Silero no longer finds speech in what the prefix window accepted. A hum or
+            # a knock reads as speech inside 320 ms and stops reading as speech once
+            # there is context around it, and such a candidate can never endpoint: it
+            # held the session on "listening" until the maximum turn length forced a
+            # transcription of near-silence.
+            self.reset()
+            return TurnDetection(candidate_evaluated=True)
         samples = len(self._utterance) // self.sample_width
         silence_samples = samples - speeches[-1]["end"]
         if silence_samples >= self._endpoint_samples:

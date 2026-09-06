@@ -494,6 +494,39 @@ async def test_pending_candidate_can_strengthen_and_cancel_without_losing_its_tu
     output.stop()
 
 
+async def test_abandoned_candidate_does_not_block_the_next_one() -> None:
+    """The detector drops a candidate it stops recognizing as speech. Its context has to
+    go with it, or the next candidate is judged against a window that already closed."""
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-55, started=True),
+        TurnDetection(candidate_evaluated=True),
+        candidate(level_dbfs=-25, started=True),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    session.feed_audio(bytes(640))
+    await asyncio.sleep(0.05)
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+
+    await session.close()
+    output.stop()
+
+
 async def test_confirmed_interruption_drops_deferred_echo_before_queue_backpressure() -> None:
     events: list[tuple[str, dict]] = []
     speech = LongAudioSpeech()
