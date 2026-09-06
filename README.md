@@ -156,6 +156,13 @@ isn't thrown away — it waits, gets transcribed, and is answered after the repl
 finishes, unless it turns out to match what Fennec just said, in which case it is
 dropped and your backend never hears it.
 
+Humming along is a harder problem than it sounds. "Hmm" arrives as loud as real
+speech and lasts about as long as "stop" — so nothing in the sound itself tells
+them apart, and guessing wrong on "stop" is much worse than guessing wrong on a
+hum. Fennec stops the reply either way and sorts it out from the transcript: a
+listening noise is dropped rather than answered, and if it left no transcript at
+all, your backend is told its reply was cut off for nothing so it can carry on.
+
 Credentials never reach the browser. Your backend talks to the gateway with one
 token, the gateway talks back with another, and the browser only ever gets a
 two-minute token good for a single session. No audio is stored anywhere.

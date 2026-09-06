@@ -152,8 +152,9 @@ developer switches remain server-owned.
 The `fennec-control` data channel accepts `ping`, `audio.check`,
 `microphone.settings`, and `session.close`. It emits `speech.started`,
 `turn.committed`, `transcript.final`, `turn.ignored`, `turn.deferred`,
-`turn.latency`, `assistant.text.delta`, `assistant.speaking`, `assistant.done`,
-`assistant.cancelled`, `state.changed`, and bounded `error` events. There is
+`turn.latency`, `speech.abandoned`, `assistant.text.delta`, `assistant.speaking`,
+`assistant.done`, `assistant.cancelled`, `state.changed`, and bounded `error`
+events. There is
 deliberately no parallel signaling WebSocket.
 
 `microphone.settings` carries the three processing flags the browser actually
@@ -217,7 +218,29 @@ a strong overlap is dropped as `turn.ignored` with reason `assistant_echo`, whic
 is what stops one false cancellation from becoming a conversation with itself.
 Neither side of that comparison is ever logged.
 
-`turn.ignored` carries `empty_transcript` or `assistant_echo`. `speech.started`
+### Listening noises
+
+A hum is not an interruption, but nothing about the sound says so: a "hmm" arrives at
+conversational loudness, and it lasts about as long as "stop" or "wait" - the two things
+a speaker most needs to work instantly. Duration and level cannot separate them, so
+Fennec does not try. It stops the reply, as it would for any confirmed speech, and
+decides afterwards.
+
+A transcript made only of wordless sounds - `hmm`, `mm-hmm`, `uh-huh`, `ah` - is ignored
+as `backchannel` and never reaches the consumer, so a hum does not become a reply about
+nothing. Words are never treated this way, however short: `yes`, `no`, `ok` and `stop`
+are answers, and dropping one for being brief is worse than answering a hum.
+
+Some hums leave no transcript at all, because Silero abandons the candidate before it
+becomes a turn. If that candidate had already stopped a reply, Fennec emits
+`speech.abandoned` with the cancelled generation. The binned audio cannot be resumed, so
+the consumer is told its reply was stopped for nothing and decides whether to carry on.
+`backchannel_turns` and `abandoned_after_cancellation` count both cases: they are the
+measurement that would justify pausing playback pending transcription rather than
+cancelling it, which is the only way to keep the reply and is not worth its complexity
+until those numbers say it is.
+
+`turn.ignored` carries `empty_transcript`, `assistant_echo`, or `backchannel`. `speech.started`
 carries `level_dbfs` and `noise_floor_dbfs` for the confirmed candidate plus
 `confirmation_ms`, the wait between the candidate starting and being confirmed;
 `assistant.cancelled` carries `level_dbfs` and its own `latency_ms`. Those two
@@ -233,7 +256,8 @@ counts speech fragments that arrived while an earlier fragment was still being
 transcribed and were safely joined before dispatch to the consumer.
 
 The summary also reports the echo gate: `echo_candidates_deferred` and
-`echo_candidates_confirmed`, `assistant_echo_turns`,
+`echo_candidates_confirmed`, `assistant_echo_turns`, `backchannel_turns`,
+`abandoned_after_cancellation`,
 `empty_unconfirmed_candidates`, `echo_reference_misses` and
 `echo_reference_evictions` (assistant text aged out before its candidate was
 classified), and `dropped_unconfirmed_turns` split by `capacity` and

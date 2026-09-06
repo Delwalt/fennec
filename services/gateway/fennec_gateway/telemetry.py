@@ -27,6 +27,8 @@ class SessionTelemetry:
         self.echo_candidates_deferred = 0
         self.echo_candidates_confirmed = 0
         self.assistant_echo_turns = 0
+        self.backchannel_turns = 0
+        self.abandoned_after_cancellation = 0
         self.dropped_unconfirmed_capacity = 0
         self.dropped_unconfirmed_generation_cancelled = 0
         self.echo_reference_evictions = 0
@@ -62,6 +64,8 @@ class SessionTelemetry:
             "echo_candidates_deferred": self.echo_candidates_deferred,
             "echo_candidates_confirmed": self.echo_candidates_confirmed,
             "assistant_echo_turns": self.assistant_echo_turns,
+            "backchannel_turns": self.backchannel_turns,
+            "abandoned_after_cancellation": self.abandoned_after_cancellation,
             "dropped_unconfirmed_turns": {
                 "capacity": self.dropped_unconfirmed_capacity,
                 "generation_cancelled": self.dropped_unconfirmed_generation_cancelled,

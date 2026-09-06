@@ -36,6 +36,12 @@ ECHO_TEXT_CHARACTERS = 8_192
 MIN_ECHO_TOKENS = 4
 ECHO_TOKEN_COVERAGE = 0.8
 TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
+# Wordless sounds only. "yes", "no", "ok" and "stop" are answers however short they
+# are, and dropping one because it was brief is worse than answering a hum.
+BACKCHANNEL_SOUNDS = frozenset(
+    {"hm", "hmm", "hmmm", "mm", "mmm", "mhm", "mmhm", "mmhmm", "uhhuh", "huh",
+     "uh", "um", "erm", "er", "ah", "aha", "oh"}
+)
 
 
 class AudioBackpressureError(RuntimeError):
@@ -188,8 +194,7 @@ class ConversationSession:
             and not detection.candidate_active
             and not detection.speech_started
         ):
-            # The detector abandoned the candidate, so its context must not outlive it.
-            self._reset_candidate_state()
+            self._abandon_candidate()
             return
 
         if detection.speech_started and self._candidate_started_at is None:
@@ -309,6 +314,17 @@ class ConversationSession:
             self._turn_queue.put_nowait(candidate)
         self._telemetry.dropped_unconfirmed_generation_cancelled += dropped
 
+    def _abandon_candidate(self) -> None:
+        cancelled = self._candidate_cancelled_generation_id
+        if cancelled is not None:
+            # A reply was stopped for speech that turned out to be nothing at all.
+            # Fennec cannot resume the audio it binned, so it says what happened and
+            # leaves carrying on from there to the consumer.
+            self._telemetry.abandoned_after_cancellation += 1
+            self._telemetry.possible_false_interruptions += 1
+            self._emit("speech.abandoned", generation_id=cancelled)
+        self._reset_candidate_state()
+
     def _reset_candidate_state(self) -> None:
         self._candidate_started_at = None
         self._candidate_confirmed = False
@@ -368,13 +384,19 @@ class ConversationSession:
             transcript_at = monotonic()
             if finalized.echo_generation_id is not None:
                 assistant_text = self._echo_text.get(finalized.echo_generation_id)
-                if assistant_text is None:
+                ignored: str | None = None
+                if _is_backchannel(text):
+                    self._telemetry.backchannel_turns += 1
+                    ignored = "backchannel"
+                elif assistant_text is None:
                     self._telemetry.echo_reference_misses += 1
                 elif _is_assistant_echo(text, assistant_text):
                     self._telemetry.assistant_echo_turns += 1
+                    ignored = "assistant_echo"
+                if ignored is not None:
                     if finalized.cancelled_generation_id is not None:
                         self._telemetry.possible_false_interruptions += 1
-                    self._emit("turn.ignored", turn_id=turn_id, reason="assistant_echo")
+                    self._emit("turn.ignored", turn_id=turn_id, reason=ignored)
                     self._emit("state.changed", state="listening")
                     return
             if self._continuations_requested:
@@ -875,6 +897,14 @@ def _phrase_boundary(text: str, *, max_characters: int) -> int | None:
         split = text.rfind(" ", 0, max_characters)
         return split if split > 0 else max_characters
     return None
+
+
+def _is_backchannel(transcript: str) -> bool:
+    """Whether a transcript is only listening noises, so it means "go on" rather than
+    anything to answer. Hyphens go first: Whisper writes the same sound as "mm-hmm",
+    "mmhmm", or "Mm hmm" depending on the phrase around it."""
+    sounds = TOKEN_PATTERN.findall(transcript.casefold().replace("-", ""))
+    return bool(sounds) and all(sound in BACKCHANNEL_SOUNDS for sound in sounds)
 
 
 def _is_assistant_echo(transcript: str, assistant_text: str) -> bool:

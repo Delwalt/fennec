@@ -229,6 +229,18 @@ class EchoConsumer(RecordingConsumer):
         yield "The server is healthy and ready."
 
 
+class ScriptedSpeech(FakeSpeech):
+    """Answers the first turn, then says whatever the barge-in was meant to be."""
+
+    def __init__(self, interruption: str) -> None:
+        super().__init__()
+        self._interruption = interruption
+
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        return "Check the server." if self.transcriptions == 1 else self._interruption
+
+
 class LongAudioSpeech(FakeSpeech):
     async def synthesize(self, text: str) -> bytes:
         self.synthesized.append(text)
@@ -241,9 +253,12 @@ class LongAudioSpeech(FakeSpeech):
         return output.getvalue()
 
 
-async def wait_for_event(events: list[tuple[str, dict]], event_type: str) -> None:
+async def wait_for_event(events: list[tuple[str, dict]], event_type: str) -> dict:
     async with asyncio.timeout(3):
-        while not any(candidate == event_type for candidate, _ in events):
+        while True:
+            for name, data in events:
+                if name == event_type:
+                    return data
             await asyncio.sleep(0.01)
 
 
@@ -492,6 +507,94 @@ async def test_pending_candidate_can_strengthen_and_cancel_without_losing_its_tu
 
     await session.close()
     output.stop()
+
+
+async def barge_in_saying(spoken: str) -> tuple[list[tuple[str, dict]], RecordingConsumer]:
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-25, started=True),
+        finalized_candidate(level_dbfs=-25),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=ScriptedSpeech(spoken),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+    session.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while len(consumer.turns) < 2 and not any(
+            event == "turn.ignored" for event, _ in events
+        ):
+            await asyncio.sleep(0.01)
+    await session.close()
+    output.stop()
+    return events, consumer
+
+
+async def test_a_hum_that_stopped_the_reply_is_not_answered() -> None:
+    events, consumer = await barge_in_saying("Hmm.")
+
+    assert any(
+        event == "turn.ignored" and data.get("reason") == "backchannel"
+        for event, data in events
+    )
+    assert [turn.text for turn in consumer.turns] == ["Check the server."]
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["backchannel_turns"] == 1
+    # It stopped a reply for a listening noise, which is a false interruption.
+    assert summary["possible_false_interruptions"] == 1
+
+
+async def test_short_answers_that_stopped_the_reply_still_reach_the_consumer() -> None:
+    """"stop" and "wait" are the same length as a hum and the most urgent things a
+    speaker says. Only wordless sounds may be dropped."""
+    for spoken in ("Stop.", "Wait!", "Yes.", "No."):
+        events, consumer = await barge_in_saying(spoken)
+        assert not any(event == "turn.ignored" for event, _ in events), spoken
+        assert [turn.text for turn in consumer.turns] == ["Check the server.", spoken]
+
+
+async def test_a_cancelled_reply_that_yields_no_speech_at_all_is_reported() -> None:
+    """Fennec cannot resume audio it binned, so the consumer has to hear that its reply
+    was stopped for nothing and decide whether to carry on."""
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-25, started=True),
+        TurnDetection(candidate_evaluated=True),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    cancelled = await wait_for_event(events, "assistant.cancelled")
+    session.feed_audio(bytes(640))
+    abandoned = await wait_for_event(events, "speech.abandoned")
+    assert abandoned["generation_id"] == cancelled["generation_id"]
+
+    await session.close()
+    output.stop()
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["abandoned_after_cancellation"] == 1
+    assert summary["possible_false_interruptions"] == 1
 
 
 async def test_abandoned_candidate_does_not_block_the_next_one() -> None:
