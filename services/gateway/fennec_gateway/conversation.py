@@ -871,6 +871,7 @@ async def response_phrases(
     iterator = deltas.__aiter__()
     pending: asyncio.Task[str] | None = asyncio.create_task(anext(iterator))
     buffer = ""
+    spoken = False
     try:
         while pending is not None:
             timeout = max_delay_seconds if buffer.strip() else None
@@ -879,6 +880,7 @@ async def response_phrases(
                 phrase = buffer
                 buffer = ""
                 if phrase.strip():
+                    spoken = True
                     yield phrase
                 continue
             try:
@@ -889,12 +891,17 @@ async def response_phrases(
             pending = asyncio.create_task(anext(iterator))
             buffer += delta
             while True:
-                boundary = _phrase_boundary(buffer, max_characters=max_characters)
+                boundary = _phrase_boundary(
+                    buffer,
+                    max_characters=max_characters,
+                    opening=not spoken,
+                )
                 if boundary is None:
                     break
                 phrase = buffer[:boundary]
                 buffer = buffer[boundary:]
                 if phrase.strip():
+                    spoken = True
                     yield phrase
         if buffer.strip():
             yield buffer
@@ -904,9 +911,26 @@ async def response_phrases(
             await asyncio.gather(pending, return_exceptions=True)
 
 
-def _phrase_boundary(text: str, *, max_characters: int) -> int | None:
+def _phrase_boundary(text: str, *, max_characters: int, opening: bool = False) -> int | None:
+    """Where the buffered reply can be cut and spoken.
+
+    Synthesis takes about half as long as the audio it produces, so every word
+    in a phrase delays it. That only matters for the opening phrase: the
+    listener waits through silence for that one, while every later phrase is
+    synthesized against audio already queued. So the opening also breaks at a
+    comma, which is where a person pauses anyway - "Yes," leaves for the
+    speakers while the rest of the sentence is still being written.
+
+    Sentence punctuation is held to a few characters in because "Dr." and "3.5"
+    are not sentence ends. A comma only ends a clause after a word, so "10,240"
+    stays whole.
+    """
     for index, character in enumerate(text):
-        if character in ".?!;:\n" and index >= 7:
+        sentence_end = character in ".?!;:\n" and index >= 7
+        clause_end = (
+            opening and character == "," and index >= 2 and text[index - 1].isalpha()
+        )
+        if sentence_end or clause_end:
             boundary = index + 1
             while boundary < len(text) and text[boundary].isspace():
                 boundary += 1

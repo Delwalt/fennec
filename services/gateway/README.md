@@ -163,6 +163,15 @@ session whose echo cancellation never engaged is visible in the logs. A flag the
 browser does not report is `null`: unknown, not disabled. No device identifier is
 accepted or logged.
 
+Kokoro takes roughly half as long as the audio it produces, so a phrase's
+length is most of the wait before it is heard. That only costs the listener on
+the *opening* phrase — every later one is synthesized while queued audio is
+still playing — so the opening also breaks at a comma, where a person pauses
+anyway. "Yes," leaves for the speakers while the rest of the sentence is still
+being written; measured against the deployed Kokoro, that cut first-phrase
+`tts_ms` from 1.60 s to 0.49 s on replies that open with a clause, and cost
+nothing on replies that do not. Later phrases keep whole sentences.
+
 `assistant.done` and the return to `listening` wait for the queued reply to
 finish playing, not for its last phrase to be enqueued. Enqueuing runs seconds
 ahead of the speaker, and announcing an idle session there meant Fennec's own

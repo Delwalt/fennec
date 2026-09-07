@@ -486,6 +486,28 @@ async def test_response_phrases_flushes_punctuation_and_bounded_delay() -> None:
     assert phrases == ["First sentence. ", "Next", " phrase"]
 
 
+async def test_response_phrases_leaves_on_the_opening_clause_only() -> None:
+    async def deltas() -> AsyncIterator[str]:
+        yield "Yes, the disk is at sixty two percent, up four points. "
+        yield "That is mostly the image cache, which I can prune."
+
+    phrases = [phrase async for phrase in response_phrases(deltas(), max_delay_seconds=1)]
+    # The opening leaves on its first comma; later commas stay inside their sentence.
+    assert phrases == [
+        "Yes, ",
+        "the disk is at sixty two percent, up four points. ",
+        "That is mostly the image cache, which I can prune.",
+    ]
+
+
+async def test_response_phrases_opening_ignores_a_comma_inside_a_number() -> None:
+    async def deltas() -> AsyncIterator[str]:
+        yield "10,240 files were copied. Done."
+
+    phrases = [phrase async for phrase in response_phrases(deltas(), max_delay_seconds=1)]
+    assert phrases == ["10,240 files were copied. ", "Done."]
+
+
 async def test_response_phrases_preserves_long_punctuation_free_text_order() -> None:
     async def deltas() -> AsyncIterator[str]:
         yield "one two three four "
