@@ -120,12 +120,14 @@ async def test_local_speech_provider_uses_session_model_language_and_voice() -> 
     await client.aclose()
 
 
-async def test_consumer_provider_validates_generation_and_ndjson_completion() -> None:
+@pytest.mark.parametrize("utterance_id", [None, "stable-utterance"])
+async def test_consumer_provider_validates_generation_and_ndjson_completion(utterance_id) -> None:
     turn = FinalizedTurn(
         session_id="session",
         turn_id="turn",
         generation_id="generation",
         text="hello",
+        utterance_id=utterance_id,
     )
     records = [
         {"type": "text.delta", "generation_id": "generation", "text": "Hi. "},
@@ -136,6 +138,7 @@ async def test_consumer_provider_validates_generation_and_ndjson_completion() ->
     def respond(request: httpx.Request) -> httpx.Response:
         assert request.headers["authorization"] == "Bearer consumer-token-at-least-24"
         assert json.loads(request.content)["text"] == "hello"
+        assert json.loads(request.content).get("utterance_id") == utterance_id
         body = "".join(json.dumps(record) + "\n" for record in records)
         return httpx.Response(
             200,

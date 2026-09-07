@@ -143,6 +143,10 @@ or infuriating. Whisper transcribes the turn, the gateway POSTs it to your
 backend, and your reply gets chopped into phrases and spoken as it streams in —
 so it starts talking before your answer is done.
 
+Every committed turn also carries an utterance id, which names what you said
+rather than the attempt at answering it — your backend gets it alongside the
+text and can use it to recognise a redelivery of the same utterance.
+
 Every reply carries a generation id. Talk over it and Fennec stops playback,
 kills the HTTP request to your backend, and bins any audio still in flight from
 the reply it just cancelled. That last part is what makes interrupting feel like

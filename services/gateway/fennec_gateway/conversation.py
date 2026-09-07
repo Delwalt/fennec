@@ -356,6 +356,7 @@ class ConversationSession:
         pcm = finalized.pcm
         speech_end_delay_ms = finalized.speech_end_delay_ms
         turn_id = secrets.token_urlsafe(12)
+        utterance_id = secrets.token_urlsafe(24)
         generation_id = secrets.token_urlsafe(12)
         self._generation_id = generation_id
         started_at = monotonic()
@@ -367,6 +368,7 @@ class ConversationSession:
             self._telemetry.forced_turns += 1
         self._emit(
             "turn.committed",
+            utterance_id=utterance_id,
             turn_id=turn_id,
             generation_id=generation_id,
             forced_by_limit=finalized.forced_by_limit,
@@ -440,6 +442,7 @@ class ConversationSession:
                 turn_id=turn_id,
                 generation_id=generation_id,
                 text=combined_text,
+                utterance_id=utterance_id,
                 latency_ms=round(transcript_latency_ms, 1),
             )
             self._emit("state.changed", state="waiting", generation_id=generation_id)

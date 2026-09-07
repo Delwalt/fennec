@@ -42,3 +42,8 @@ await fennec.createClientSession({
 
 This is the boundary an application settings UI should call through. The browser must
 not call Fennec's authenticated internal session endpoint directly.
+
+### Logical utterance identity
+
+The gateway mints `utterance_id` for each committed utterance and sends it to the
+consumer. See `services/gateway/README.md` for the contract.

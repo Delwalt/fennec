@@ -25,6 +25,8 @@ export type FennecTurn = {
   sessionId: string;
   turnId: string;
   generationId: string;
+  /** Stable logical utterance identity; absent on legacy gateways. */
+  utteranceId?: string;
   text: string;
 };
 
@@ -244,6 +246,7 @@ function parseTurn(value: unknown): FennecTurn {
     sessionId: nonEmptyString(object.session_id),
     turnId: nonEmptyString(object.turn_id),
     generationId: nonEmptyString(object.generation_id),
+    ...(object.utterance_id === undefined ? {} : { utteranceId: nonEmptyString(object.utterance_id) }),
     text: nonEmptyString(object.text),
   };
 }

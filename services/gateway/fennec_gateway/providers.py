@@ -56,6 +56,7 @@ class FinalizedTurn:
     turn_id: str
     generation_id: str
     text: str
+    utterance_id: str | None = None
 
 
 class LocalSpeechProvider:
@@ -214,6 +215,7 @@ class HttpConsumerProvider:
                     "turn_id": turn.turn_id,
                     "generation_id": turn.generation_id,
                     "text": turn.text,
+                    **({"utterance_id": turn.utterance_id} if turn.utterance_id else {}),
                 },
             ) as response:
                 response.raise_for_status()

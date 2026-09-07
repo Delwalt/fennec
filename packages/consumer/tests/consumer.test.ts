@@ -188,3 +188,29 @@ function turnRequest(token: string, signal?: AbortSignal): Request {
     ...(signal ? { signal } : {}),
   });
 }
+
+describe('utterance identity compatibility', () => {
+  it.each([undefined, 'utterance-stable'])('preserves identity independently of generation: %s', async (utteranceId) => {
+    const seen: unknown[] = [];
+    const consumer = createFennecConsumer({
+      gatewayUrl: 'http://gateway.test', serviceCredential: 'service', consumerToken: 'secret',
+      respond: async function* (turn) { seen.push(turn); yield 'hello'; },
+    });
+    for (const generation of ['g1', 'g2']) {
+      const response = await consumer.turnHandler()(new Request('http://consumer.test', {
+        method: 'POST', headers: { authorization: 'Bearer secret' },
+        body: JSON.stringify({ session_id: 'session', turn_id: 'turn', generation_id: generation, text: 'hello', ...(utteranceId ? { utterance_id: utteranceId } : {}) }),
+      }));
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('text.done');
+    }
+    expect(seen).toEqual(['g1', 'g2'].map(generationId => ({ sessionId: 'session', turnId: 'turn', generationId, text: 'hello', ...(utteranceId ? { utteranceId } : {}) })));
+  });
+  it('rejects malformed identity instead of silently treating it as legacy', async () => {
+    const respond = vi.fn(async function* () {});
+    const consumer = createFennecConsumer({ gatewayUrl: 'http://gateway.test', serviceCredential: 'service', consumerToken: 'secret', respond });
+    const response = await consumer.turnHandler()(new Request('http://consumer.test', { method: 'POST', headers: { authorization: 'Bearer secret' }, body: JSON.stringify({ session_id: 's', turn_id: 't', generation_id: 'g', text: 'hello', utterance_id: 42 }) }));
+    expect(response.status).toBe(400);
+    expect(respond).not.toHaveBeenCalled();
+  });
+});

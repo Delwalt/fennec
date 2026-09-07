@@ -324,3 +324,15 @@ across tenants - capacity is global, so one busy tenant can exhaust it.
   assistant playback, conversation state, and transcripts.
 - Fennec service and consumer credentials never enter browser code.
 - The mock consumer is a deployment smoke fixture, not application logic.
+
+
+### Logical utterance identity
+
+The gateway attaches `utterance_id` to `turn.committed` and the consumer request.
+It identifies one committed utterance independently of its generation. The TypeScript
+consumer exposes optional `utteranceId`; absent IDs remain supported for legacy gateways,
+and malformed supplied IDs are rejected. Responses remain string-based NDJSON.
+Any future retry must reuse the original utterance ID, not mint a new one.
+This is correlation metadata, not durable admission or an exactly-once guarantee:
+applications still own deduplication, authorization and recovery. No automatic
+turn retries or session-resume behavior are introduced by this change.
