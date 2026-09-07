@@ -8,6 +8,7 @@ from .config import Settings
 MODEL_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._/-]*$"
 VOICE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 LANGUAGE_PATTERN = r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$"
+VOCABULARY_PATTERN = r"^[^\x00-\x1f\x7f]*$"
 
 
 class VoiceConfiguration(BaseModel):
@@ -17,6 +18,7 @@ class VoiceConfiguration(BaseModel):
     tts_model: str = Field(min_length=1, max_length=256, pattern=MODEL_ID_PATTERN)
     tts_voice: str = Field(min_length=1, max_length=128, pattern=VOICE_ID_PATTERN)
     speech_language: str = Field(min_length=2, max_length=32, pattern=LANGUAGE_PATTERN)
+    speech_vocabulary: str = Field(default="", max_length=1_024, pattern=VOCABULARY_PATTERN)
     vad_threshold: float = Field(ge=0.1, le=0.9)
     endpoint_silence_ms: int = Field(ge=300, le=3_000)
     prefix_ms: int = Field(ge=100, le=1_000)
@@ -64,6 +66,11 @@ class VoiceConfigurationOverrides(BaseModel):
         min_length=2,
         max_length=32,
         pattern=LANGUAGE_PATTERN,
+    )
+    speech_vocabulary: str | None = Field(
+        default=None,
+        max_length=1_024,
+        pattern=VOCABULARY_PATTERN,
     )
     vad_threshold: float | None = Field(default=None, ge=0.1, le=0.9)
     endpoint_silence_ms: int | None = Field(default=None, ge=300, le=3_000)

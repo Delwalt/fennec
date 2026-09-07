@@ -35,6 +35,7 @@ export type FennecVoiceConfiguration = {
   ttsModel?: string;
   ttsVoice?: string;
   speechLanguage?: string;
+  speechVocabulary?: string;
   vadThreshold?: number;
   endpointSilenceMs?: number;
   prefixMs?: number;
@@ -224,6 +225,9 @@ function serializeVoiceConfiguration(
     ...(configuration.speechLanguage === undefined
       ? {}
       : { speech_language: configuration.speechLanguage }),
+    ...(configuration.speechVocabulary === undefined
+      ? {}
+      : { speech_vocabulary: configuration.speechVocabulary }),
     ...(configuration.vadThreshold === undefined
       ? {}
       : { vad_threshold: configuration.vadThreshold }),

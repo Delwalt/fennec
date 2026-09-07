@@ -35,6 +35,7 @@ await fennec.createClientSession({
   configuration: {
     endpointSilenceMs: 1600,
     speechLanguage: 'en-IN',
+    speechVocabulary: 'Fennec Silero Kokoro',
     ttsVoice: 'af_sky',
   },
 });

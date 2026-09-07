@@ -138,13 +138,17 @@ The authenticated session-creation request may include a bounded
     "endpoint_silence_ms": 1600,
     "vad_threshold": 0.45,
     "speech_language": "en-IN",
+    "speech_vocabulary": "Fennec Silero Kokoro",
     "tts_voice": "af_sky"
   }
 }
 ```
 
 Model identifiers, language, voice, and all five turn settings are scoped to
-the created session. Requested local models are prepared before a session is
+the created session. `speech_vocabulary` is a line of names the recognizer has
+not been trained on - product, host and person names - passed to Whisper as
+hotwords so it spells them rather than substituting the nearest English word it
+knows. Fennec does not know an application's names, so the default is empty. Requested local models are prepared before a session is
 returned. Only the authenticated backend API and the development-only harness
 can request overrides; service URLs, credentials, capacity, timeouts, and
 developer switches remain server-owned.

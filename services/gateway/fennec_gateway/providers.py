@@ -29,6 +29,7 @@ class SpeechProvider(Protocol):
         *,
         model: str | None = None,
         language: str | None = None,
+        vocabulary: str | None = None,
     ) -> str: ...
 
     async def synthesize(
@@ -111,6 +112,7 @@ class LocalSpeechProvider:
         *,
         model: str | None = None,
         language: str | None = None,
+        vocabulary: str | None = None,
     ) -> str:
         wav = pcm16_mono_wav(pcm)
         try:
@@ -120,6 +122,7 @@ class LocalSpeechProvider:
                     "model": model or self._stt_model,
                     "language": language or self._language,
                     "response_format": "json",
+                    **({"hotwords": vocabulary} if vocabulary else {}),
                 },
                 files={"file": ("turn.wav", wav, "audio/wav")},
             )

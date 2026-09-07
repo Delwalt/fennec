@@ -106,17 +106,46 @@ async def test_local_speech_provider_uses_session_model_language_and_voice() -> 
         client=client,
     )
 
-    await provider.transcribe(bytes(3_200), model="custom-stt", language="en-IN")
+    await provider.transcribe(
+        bytes(3_200),
+        model="custom-stt",
+        language="en-IN",
+        vocabulary="Fennec Silero",
+    )
     await provider.synthesize("Hello", model="custom-tts", voice="custom-voice")
 
     assert b'custom-stt' in requests[0].content
     assert b'en-IN' in requests[0].content
+    assert b'Fennec Silero' in requests[0].content
     assert json.loads(requests[1].content) == {
         "model": "custom-tts",
         "voice": "custom-voice",
         "input": "Hello",
         "response_format": "wav",
     }
+    await client.aclose()
+
+
+async def test_local_speech_provider_omits_an_empty_vocabulary() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"text": "transcript"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    provider = LocalSpeechProvider(
+        base_url="http://speech.test/v1",
+        stt_model="default-stt",
+        tts_model="default-tts",
+        voice="default-voice",
+        language="en",
+        timeout_seconds=10,
+        client=client,
+    )
+
+    await provider.transcribe(bytes(3_200), vocabulary="")
+    assert b"hotwords" not in requests[0].content
     await client.aclose()
 
 

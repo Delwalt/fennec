@@ -190,7 +190,7 @@ class SlowNumberedSpeech(FakeSpeech):
 class ConfigurableSpeech(FakeSpeech):
     def __init__(self) -> None:
         super().__init__()
-        self.transcription_configuration: tuple[str | None, str | None] | None = None
+        self.transcription_configuration: tuple[str | None, str | None, str | None] | None = None
         self.synthesis_configuration: list[tuple[str | None, str | None]] = []
 
     async def transcribe(
@@ -199,9 +199,10 @@ class ConfigurableSpeech(FakeSpeech):
         *,
         model: str | None = None,
         language: str | None = None,
+        vocabulary: str | None = None,
     ) -> str:
         self.transcriptions += 1
-        self.transcription_configuration = (model, language)
+        self.transcription_configuration = (model, language, vocabulary)
         return "Use this configured voice."
 
     async def synthesize(
@@ -444,6 +445,7 @@ async def test_session_speech_configuration_reaches_stt_and_tts() -> None:
         tts_model="custom-kokoro",
         tts_voice="custom_voice",
         speech_language="en-IN",
+        speech_vocabulary="Fennec Silero Kokoro",
         vad_threshold=0.45,
         endpoint_silence_ms=1_500,
         prefix_ms=400,
@@ -466,7 +468,11 @@ async def test_session_speech_configuration_reaches_stt_and_tts() -> None:
     await conversation.close()
     output.stop()
 
-    assert speech.transcription_configuration == ("custom-whisper", "en-IN")
+    assert speech.transcription_configuration == (
+        "custom-whisper",
+        "en-IN",
+        "Fennec Silero Kokoro",
+    )
     assert speech.synthesis_configuration == [
         ("custom-kokoro", "custom_voice"),
         ("custom-kokoro", "custom_voice"),

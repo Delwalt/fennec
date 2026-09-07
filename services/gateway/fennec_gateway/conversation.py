@@ -386,6 +386,7 @@ class ConversationSession:
                     pcm,
                     model=self._configuration.stt_model,
                     language=self._configuration.speech_language,
+                    vocabulary=self._configuration.speech_vocabulary,
                 )
             transcript_at = monotonic()
             if finalized.echo_generation_id is not None:
@@ -845,6 +846,7 @@ class ConversationRuntime:
                 pcm16,
                 model=self._default_configuration.stt_model,
                 language=self._default_configuration.speech_language,
+                vocabulary=self._default_configuration.speech_vocabulary,
             )
         if not transcript:
             raise ProviderError("local speech warm-up returned an empty transcript")
