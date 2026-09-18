@@ -326,6 +326,30 @@ async def test_complete_turn_emits_final_transcript_and_queues_streamed_speech()
     assert summaries[0]["latency_ms"]["first_audio_queued_ms"]["count"] == 1
 
 
+async def test_a_stalled_audio_worker_drops_old_audio_instead_of_ending_the_call() -> None:
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    conversation = ConversationSession(
+        session_id="session",
+        speech=FakeSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=ScriptedDetector(),  # type: ignore[arg-type]
+        audio_queue_frames=2,
+    )
+    # No await between frames, so the worker never runs and the queue overflows.
+    for _ in range(5):
+        conversation.feed_audio(bytes(640))
+
+    await conversation.close()
+    output.stop()
+
+    assert not [data for event, data in events if event == "error"]
+    summaries = [data for event, data in events if event == "telemetry.session.summary"]
+    assert summaries[0]["dropped_input_frames"] == 3
+
+
 async def test_speech_after_a_pause_preserves_the_transcript_already_in_flight() -> None:
     events: list[tuple[str, dict]] = []
     speech = CoordinatedSpeech()

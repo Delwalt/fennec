@@ -13,7 +13,7 @@ from aiortc.sdp import candidate_from_sdp
 from av import AudioResampler
 
 from .config import DEFAULT_TENANT_ID
-from .conversation import AudioBackpressureError, ConversationRuntime, ConversationSession
+from .conversation import ConversationRuntime, ConversationSession
 from .media import AssistantAudioTrack
 from .session_configuration import VoiceConfiguration
 
@@ -190,9 +190,6 @@ class VoiceSession:
                         self.conversation.feed_audio(pcm)
         except (MediaStreamError, asyncio.CancelledError):
             pass
-        except AudioBackpressureError:
-            logger.warning("audio backpressure session_id=%s", self.session_id)
-            await self.close()
         except Exception:
             logger.exception("microphone track failed session_id=%s", self.session_id)
 

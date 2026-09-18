@@ -116,12 +116,15 @@ class ConversationSession:
     def feed_audio(self, pcm: bytes) -> None:
         if self._closed:
             return
-        try:
-            self._audio_queue.put_nowait(pcm)
-            self._telemetry.observe_input_queue(self._audio_queue.qsize())
-        except asyncio.QueueFull as error:
-            self._emit("error", code="audio_backpressure", component="turn_detection")
-            raise AudioBackpressureError("microphone audio queue reached its limit") from error
+        # A worker that falls behind costs the oldest audio, not the call: closing the
+        # session here ended live conversations over a two-second stall.
+        if self._audio_queue.full():
+            self._audio_queue.get_nowait()
+            if self._telemetry.dropped_input_frames == 0:
+                logger.warning("microphone audio dropped session_id=%s", self._session_id)
+            self._telemetry.dropped_input_frames += 1
+        self._audio_queue.put_nowait(pcm)
+        self._telemetry.observe_input_queue(self._audio_queue.qsize())
 
     async def close(self) -> None:
         if self._closed:
