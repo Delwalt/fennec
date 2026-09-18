@@ -992,6 +992,118 @@ async def test_duck_backstop_does_not_cancel_a_later_unrelated_generation() -> N
     assert summary["possible_false_interruptions"] == 0
 
 
+class RacingConfirmSpeech(FakeSpeech):
+    """Generation A's second phrase never finishes synthesizing, so A stays the
+    active generation - and stays cancellable - until the backstop explicitly
+    cancels it. The backstop's own transcription (the second transcribe call)
+    blocks until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.backstop_started = asyncio.Event()
+        self.release_backstop = asyncio.Event()
+
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        if self.transcriptions == 1:
+            return "Check the server."
+        self.backstop_started.set()
+        await self.release_backstop.wait()
+        return "Actually check the logs too."
+
+    async def synthesize(self, text: str) -> bytes:
+        self.synthesized.append(text)
+        if len(self.synthesized) == 1:
+            return await super().synthesize(text)
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+async def _run_detector_feed_inline(func, *args, **kwargs):
+    """Stand-in for asyncio.to_thread during the race test below.
+
+    _run_audio_worker always calls _detector.feed() through asyncio.to_thread,
+    even for this trivial fake detector - a real thread-pool round trip. Its
+    OS-scheduled latency reliably dominates the couple of pure in-process
+    asyncio ticks a cancelled generation's own unwind takes, in every ordering
+    tried, every time: the audio worker's next candidate always finished being
+    confirmed only after the replacement generation was already active, never
+    inside the gap where self._generation_id is None but self._assistant_active
+    is still True. That gap is real - it is exactly what _begin_duck's early
+    return exists for - but a fake detector with no work to do cannot be
+    delayed *less* than a real thread hop, so this specific interleaving could
+    not be produced with the fakes alone. Removing the one genuinely
+    OS-scheduled (rather than cooperative-asyncio-scheduled) step is what makes
+    the ordering reproducible; every other call in the test below still goes
+    through the real session, detector protocol, and cancellation code."""
+    return func(*args, **kwargs)
+
+
+async def test_confirming_while_a_duck_backstop_cancellation_is_in_flight_reports_listening() -> None:
+    """_begin_duck can find self._generation_id already None: a duck backstop
+    cancelling the very generation a new candidate's echo-risk window still
+    reads as live - the risk decay is a timer, not tied to the cancellation -
+    can null it between that window looking open and this candidate reaching
+    confirmation. _confirm_candidate must not assume a duck happened just
+    because one was attempted: when it did not, the assistant genuinely
+    stopped, and the listening emit is the only thing that says so."""
+    events: list[tuple[str, dict]] = []
+    consumer = FakeConsumer()
+    output = AssistantAudioTrack()
+    speech = RacingConfirmSpeech()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),                # -> generation A
+        candidate(level_dbfs=-25, started=True, duration_ms=100),   # ducks A
+        candidate(level_dbfs=-25, duration_ms=100),                 # no growth
+        finalized_candidate(level_dbfs=-25, duration_ms=100),       # spawns the backstop
+        candidate(level_dbfs=-25, started=True, duration_ms=100),   # a new candidate confirms
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+        sustained_speech_ms=10_000,
+        backchannel_gap_ms=20,
+    )
+
+    with patch("fennec_gateway.conversation.asyncio.to_thread", _run_detector_feed_inline):
+        session.feed_audio(bytes(640))
+        await wait_for_event(events, "assistant.speaking")
+        session.feed_audio(bytes(640))
+        await wait_for_event(events, "assistant.ducked")
+        await asyncio.sleep(0.05)  # let BACKCHANNEL_GAP_MS elapse in real time
+        session.feed_audio(bytes(640))
+        await wait_for_event(events, "assistant.unducked")
+        session.feed_audio(bytes(640))
+        await speech.backstop_started.wait()
+
+        # No await between these two: this is what schedules the backstop's
+        # cancellation of generation A and the new candidate's confirmation
+        # back to back, so the second lands while the first is still unwinding.
+        speech.release_backstop.set()
+        session.feed_audio(bytes(640))
+
+        await wait_for_event(events, "assistant.cancelled")
+
+    await session.close()
+    output.stop()
+
+    event_names = [event for event, _ in events]
+    listening_indices = [
+        index
+        for index, (event, data) in enumerate(events)
+        if event == "state.changed" and data.get("state") == "listening"
+    ]
+    assert listening_indices, "the client must be told the assistant stopped"
+    assert listening_indices[0] < event_names.index("assistant.cancelled"), (
+        "the client must be told the assistant stopped while the duck backstop's "
+        "own cancellation was still in flight, not only afterward"
+    )
+
+
 async def test_a_cancelled_reply_that_yields_no_speech_at_all_is_reported() -> None:
     """Fennec cannot resume audio it binned, so the consumer has to hear that its reply
     was stopped for nothing and decide whether to carry on. This only happens when the

@@ -69,3 +69,33 @@ async def test_new_generation_starts_undamped_even_after_a_duck() -> None:
 
     assert track.gain == 1.0
     assert samples[0] == 20_000
+
+
+async def test_recv_applies_duck_gain_to_the_frames_it_actually_returns() -> None:
+    """The tests above call _apply_gain(track._next_pcm(...)) directly, which
+    proves the ramp arithmetic but not that recv() - the method something is
+    actually pulling frames from over the wire - applies it. If _apply_gain
+    were dropped from recv() in a later refactor, ducking would silently stop
+    working end to end and the tests above would still pass. This one reads
+    samples off the AudioFrame recv() actually returns instead."""
+    track = AssistantAudioTrack()
+    track.begin_generation("g1")
+    frame = _constant_pcm(20_000, track.samples_per_frame)
+    await track.enqueue_pcm(generation_id="g1", pcm=frame * 8)
+
+    # recv() paces itself against wall-clock time via _started_at, so each call
+    # after the first genuinely sleeps for one frame's duration (20ms) - keep
+    # the frame count small rather than disabling that pacing.
+    before_duck = await track.recv()
+    track.duck()
+    after_duck = await track.recv()
+
+    before_samples = np.frombuffer(bytes(before_duck.planes[0]), dtype="<i2")
+    after_samples = np.frombuffer(bytes(after_duck.planes[0]), dtype="<i2")
+
+    assert before_samples[0] == 20_000
+    # The ramp starts attenuating from the very first sample after duck() is
+    # called, so even the start of this frame is already below the untouched
+    # input level, and it keeps falling within the frame.
+    assert after_samples[0] < 20_000
+    assert after_samples[-1] < after_samples[0]
