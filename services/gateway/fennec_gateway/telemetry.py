@@ -36,6 +36,10 @@ class SessionTelemetry:
         self.forced_turns = 0
         self.provider_errors = 0
         self.input_queue_peak_frames = 0
+        self.ducked_candidates = 0
+        self.duck_restored_by_shape = 0
+        self.duck_confirmed_by_shape = 0
+        self.duck_backstop_late_cancellations = 0
 
     def timing(self, name: str, milliseconds: float) -> None:
         self._samples[name].append(max(0.0, milliseconds))
@@ -75,6 +79,10 @@ class SessionTelemetry:
             "forced_turns": self.forced_turns,
             "provider_errors": self.provider_errors,
             "input_queue_peak_frames": self.input_queue_peak_frames,
+            "ducked_candidates": self.ducked_candidates,
+            "duck_restored_by_shape": self.duck_restored_by_shape,
+            "duck_confirmed_by_shape": self.duck_confirmed_by_shape,
+            "duck_backstop_late_cancellations": self.duck_backstop_late_cancellations,
             "output_queue_peak_frames": output_queue_peak_frames,
             "stale_audio_frames_rejected": stale_audio_frames_rejected,
             "latency_ms": {

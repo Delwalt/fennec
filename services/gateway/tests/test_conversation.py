@@ -72,19 +72,26 @@ class FakeConsumer:
         pass
 
 
-class BargeInDetector:
-    def __init__(self) -> None:
+class GrowingBargeInDetector:
+    """After the assistant starts speaking, every call reports a candidate that has
+    grown longer than the last - the shape of someone actually taking the floor,
+    not a listening noise that stops on its own."""
+
+    def __init__(self, *, step_ms: float = 200.0) -> None:
         self.calls = 0
+        self._duration_ms = 0.0
+        self._step_ms = step_ms
 
     def feed(self, _: bytes) -> TurnDetection:
         self.calls += 1
         if self.calls == 1:
             return TurnDetection(finalized_audio=bytes(6_400))
+        self._duration_ms += self._step_ms
         return TurnDetection(
-            speech_started=True,
+            speech_started=self.calls == 2,
             candidate_active=True,
             candidate_evaluated=True,
-            speech_duration_ms=200,
+            speech_duration_ms=self._duration_ms,
             speech_level_dbfs=-20,
             recent_speech_level_dbfs=-20,
         )
@@ -227,21 +234,21 @@ class SequenceDetector:
         pass
 
 
-def candidate(*, level_dbfs: float, started: bool = False) -> TurnDetection:
+def candidate(*, level_dbfs: float, started: bool = False, duration_ms: float = 200) -> TurnDetection:
     return TurnDetection(
         speech_started=started,
         candidate_active=True,
         candidate_evaluated=True,
-        speech_duration_ms=200,
+        speech_duration_ms=duration_ms,
         speech_level_dbfs=level_dbfs,
         recent_speech_level_dbfs=level_dbfs,
     )
 
 
-def finalized_candidate(*, level_dbfs: float) -> TurnDetection:
+def finalized_candidate(*, level_dbfs: float, duration_ms: float = 300) -> TurnDetection:
     return TurnDetection(
         candidate_evaluated=True,
-        speech_duration_ms=300,
+        speech_duration_ms=duration_ms,
         speech_level_dbfs=level_dbfs,
         recent_speech_level_dbfs=level_dbfs,
         finalized_audio=bytes(6_400),
@@ -531,19 +538,26 @@ async def test_response_phrases_preserves_long_punctuation_free_text_order() -> 
     assert all(len(phrase) <= 23 for phrase in phrases)
 
 
-async def test_new_user_speech_cancels_the_active_generation_immediately() -> None:
+async def test_new_user_speech_cancels_the_active_generation_once_sustained() -> None:
+    """Confirming a candidate now ducks rather than cancelling; the cancel itself
+    only fires once the candidate has grown past SUSTAINED_SPEECH_MS. The cancel
+    step itself stays fast - that is what latency_ms below measures, not the wait
+    to get there."""
     events: list[tuple[str, dict]] = []
     output = AssistantAudioTrack()
     conversation = ConversationSession(
         session_id="session",
-        speech=BlockingSpeech(),
+        speech=FakeSpeech(),
         consumer=FakeConsumer(),
         output=output,
         send_event=lambda event_type, data: events.append((event_type, data)),
-        detector=BargeInDetector(),  # type: ignore[arg-type]
+        detector=GrowingBargeInDetector(step_ms=200),  # type: ignore[arg-type]
+        sustained_speech_ms=300,
     )
     conversation.feed_audio(bytes(640))
-    await wait_for_event(events, "assistant.text.delta")
+    await wait_for_event(events, "assistant.speaking")
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
     conversation.feed_audio(bytes(640))
     await wait_for_event(events, "assistant.cancelled")
 
@@ -621,6 +635,7 @@ async def test_pending_candidate_can_strengthen_and_cancel_without_losing_its_tu
         output=output,
         send_event=lambda event_type, data: events.append((event_type, data)),
         detector=detector,  # type: ignore[arg-type]
+        sustained_speech_ms=250,
     )
     session.feed_audio(bytes(640))
     await wait_for_event(events, "assistant.speaking")
@@ -629,8 +644,9 @@ async def test_pending_candidate_can_strengthen_and_cancel_without_losing_its_tu
     assert not any(event == "assistant.cancelled" for event, _ in events)
 
     session.feed_audio(bytes(640))
-    await wait_for_event(events, "assistant.cancelled")
+    await wait_for_event(events, "assistant.ducked")
     session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
     async with asyncio.timeout(3):
         while speech.transcriptions < 2:
             await asyncio.sleep(0.01)
@@ -659,11 +675,16 @@ async def barge_in_saying(spoken: str) -> tuple[list[tuple[str, dict]], Recordin
         output=output,
         send_event=lambda event_type, data: events.append((event_type, data)),
         detector=detector,  # type: ignore[arg-type]
+        # The candidate confirms at 200ms of speech and ducks; the finalize tick
+        # carries 300ms, crossing this threshold and resolving the shape check to
+        # "sustained" in the same step Silero's own endpoint closes the turn - the
+        # same timing the immediate-cancel design used to have.
+        sustained_speech_ms=250,
     )
     session.feed_audio(bytes(640))
     await wait_for_event(events, "assistant.speaking")
     session.feed_audio(bytes(640))
-    await wait_for_event(events, "assistant.cancelled")
+    await wait_for_event(events, "assistant.ducked")
     session.feed_audio(bytes(640))
     async with asyncio.timeout(3):
         while len(consumer.turns) < 2 and not any(
@@ -698,15 +719,158 @@ async def test_short_answers_that_stopped_the_reply_still_reach_the_consumer() -
         assert [turn.text for turn in consumer.turns] == ["Check the server.", spoken]
 
 
-async def test_a_cancelled_reply_that_yields_no_speech_at_all_is_reported() -> None:
-    """Fennec cannot resume audio it binned, so the consumer has to hear that its reply
-    was stopped for nothing and decide whether to carry on."""
+async def test_short_burst_during_assistant_speech_ducks_then_restores() -> None:
+    """A burst that stops growing and sits in silence past BACKCHANNEL_GAP_MS
+    resolves as a listening noise from its shape alone - the reply is never
+    cancelled, so it finishes on its own once the backstop clears the candidate."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-25, started=True, duration_ms=100),
+        candidate(level_dbfs=-25, duration_ms=100),
+        finalized_candidate(level_dbfs=-25, duration_ms=100),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=ScriptedSpeech("Mm-hmm."),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+        sustained_speech_ms=10_000,
+        backchannel_gap_ms=20,
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
+    await asyncio.sleep(0.05)  # let BACKCHANNEL_GAP_MS elapse in real time
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.unducked")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.done")
+    await session.close()
+    output.stop()
+
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+    assert [turn.text for turn in consumer.turns] == ["Check the server."]
+    unducked = [data for event, data in events if event == "assistant.unducked"]
+    assert unducked[0]["reason"] == "short_burst"
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["ducked_candidates"] == 1
+    assert summary["duck_restored_by_shape"] == 1
+
+
+async def test_sustained_speech_during_assistant_speech_cancels_after_the_shape_check() -> None:
+    """Speech that keeps growing past SUSTAINED_SPEECH_MS is a real interruption -
+    ducked first, then cancelled once its shape says so, with no transcript
+    involved in that decision."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-25, started=True, duration_ms=100),
+        candidate(level_dbfs=-25, duration_ms=400),
+        candidate(level_dbfs=-25, duration_ms=800),
+        finalized_candidate(level_dbfs=-25, duration_ms=800),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=ScriptedSpeech("Please also check the disk."),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+        sustained_speech_ms=700,
+        backchannel_gap_ms=10_000,
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
+    session.feed_audio(bytes(640))
+    await asyncio.sleep(0)
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+    session.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while len(consumer.turns) < 2:
+            await asyncio.sleep(0.01)
+    await session.close()
+    output.stop()
+
+    assert [turn.text for turn in consumer.turns] == [
+        "Check the server.",
+        "Please also check the disk.",
+    ]
+    cancelled = [data for event, data in events if event == "assistant.cancelled"]
+    assert cancelled[0]["reason"] == "user_speech"
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["duck_confirmed_by_shape"] == 1
+
+
+async def test_speech_resuming_inside_the_gap_still_reaches_sustain() -> None:
+    """A candidate that stalls briefly, then grows again before BACKCHANNEL_GAP_MS
+    has elapsed, must not be written off as a short burst - it keeps accumulating
+    toward the sustain threshold as if the stall never happened."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-25, started=True, duration_ms=100),
+        candidate(level_dbfs=-25, duration_ms=100),  # a brief stall, no growth
+        candidate(level_dbfs=-25, duration_ms=500),  # resumes before the gap elapses
+        candidate(level_dbfs=-25, duration_ms=900),
+        finalized_candidate(level_dbfs=-25, duration_ms=900),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=ScriptedSpeech("Actually also restart the cache."),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+        sustained_speech_ms=800,
+        backchannel_gap_ms=200,
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
+    session.feed_audio(bytes(640))  # the stall
+    session.feed_audio(bytes(640))  # resumes growth well inside the 200ms gap
+    await asyncio.sleep(0)
+    assert not any(event == "assistant.unducked" for event, _ in events)
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
+    session.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while len(consumer.turns) < 2:
+            await asyncio.sleep(0.01)
+    await session.close()
+    output.stop()
+
+    assert [turn.text for turn in consumer.turns] == [
+        "Check the server.",
+        "Actually also restart the cache.",
+    ]
+    assert not any(event == "assistant.unducked" for event, _ in events)
+
+
+async def test_ducking_does_not_emit_a_listening_state_change() -> None:
+    """A duck leaves the assistant audibly speaking, just quieter - the client
+    must not be told the session moved to "listening" until a real cancel (or
+    session close) actually happens."""
     events: list[tuple[str, dict]] = []
     output = AssistantAudioTrack()
     detector = SequenceDetector([
         TurnDetection(finalized_audio=bytes(6_400)),
-        candidate(level_dbfs=-25, started=True),
-        TurnDetection(candidate_evaluated=True),
+        candidate(level_dbfs=-25, started=True, duration_ms=100),
     ])
     session = ConversationSession(
         session_id="session",
@@ -718,6 +882,42 @@ async def test_a_cancelled_reply_that_yields_no_speech_at_all_is_reported() -> N
     )
     session.feed_audio(bytes(640))
     await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
+    await asyncio.sleep(0)
+
+    listening_states = [
+        data for event, data in events
+        if event == "state.changed" and data.get("state") == "listening"
+    ]
+    assert listening_states == []
+
+    await session.close()
+    output.stop()
+
+
+async def test_a_cancelled_reply_that_yields_no_speech_at_all_is_reported() -> None:
+    """Fennec cannot resume audio it binned, so the consumer has to hear that its reply
+    was stopped for nothing and decide whether to carry on. This only happens when the
+    candidate confirms before there is any audio to duck - once audio is playing, a
+    confirmed candidate ducks instead, and there is nothing left to lose this way."""
+    events: list[tuple[str, dict]] = []
+    output = AssistantAudioTrack()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),
+        candidate(level_dbfs=-25, started=True),
+        TurnDetection(candidate_evaluated=True),
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=BlockingSpeech(),
+        consumer=FakeConsumer(),
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+    )
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.text.delta")
     session.feed_audio(bytes(640))
     cancelled = await wait_for_event(events, "assistant.cancelled")
     session.feed_audio(bytes(640))
@@ -758,7 +958,7 @@ async def test_abandoned_candidate_does_not_block_the_next_one() -> None:
     assert not any(event == "assistant.cancelled" for event, _ in events)
 
     session.feed_audio(bytes(640))
-    await wait_for_event(events, "assistant.cancelled")
+    await wait_for_event(events, "assistant.ducked")
 
     await session.close()
     output.stop()
@@ -785,6 +985,7 @@ async def test_confirmed_interruption_drops_deferred_echo_before_queue_backpress
         send_event=lambda event_type, data: events.append((event_type, data)),
         detector=detector,  # type: ignore[arg-type]
         turn_queue_size=1,
+        sustained_speech_ms=250,
     )
     session.feed_audio(bytes(640))
     await wait_for_event(events, "assistant.speaking")
@@ -793,8 +994,9 @@ async def test_confirmed_interruption_drops_deferred_echo_before_queue_backpress
     await asyncio.sleep(0.05)
 
     session.feed_audio(bytes(640))
-    await wait_for_event(events, "assistant.cancelled")
+    await wait_for_event(events, "assistant.ducked")
     session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.cancelled")
     async with asyncio.timeout(3):
         while speech.transcriptions < 2:
             await asyncio.sleep(0.01)
@@ -907,7 +1109,8 @@ async def test_speech_during_the_unplayed_tail_is_a_barge_in_not_a_new_turn() ->
         consumer=FakeConsumer(),
         output=output,
         send_event=lambda event_type, data: events.append((event_type, data)),
-        detector=BargeInDetector(),  # type: ignore[arg-type]
+        detector=GrowingBargeInDetector(step_ms=200),  # type: ignore[arg-type]
+        sustained_speech_ms=300,
     )
     # Nothing plays this track, so every synthesized phrase is still queued when
     # the last one is enqueued - the window the assistant is audibly speaking in.
@@ -915,6 +1118,8 @@ async def test_speech_during_the_unplayed_tail_is_a_barge_in_not_a_new_turn() ->
     async with asyncio.timeout(3):
         while [event for event, _ in events].count("assistant.text.delta") < 2:
             await asyncio.sleep(0.01)
+    conversation.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
     conversation.feed_audio(bytes(640))
     await wait_for_event(events, "assistant.cancelled")
 
