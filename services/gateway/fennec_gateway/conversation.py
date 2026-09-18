@@ -57,6 +57,13 @@ SUSTAINED_SPEECH_MS = 750.0
 # the endpoint silence that closes out a normal turn - this only decides whether
 # to keep ducking, not whether the turn itself is finished.
 BACKCHANNEL_GAP_MS = 500.0
+# Every short burst pays for a background STT call while its backstop runs.
+# Nodding through a long reply must not let those stack up unbounded; past this
+# many concurrent backstops, a new one is skipped rather than queued; the
+# candidate it would have watched already had its volume restored optimistically,
+# so the listener notices nothing either way, and the rare late-cancel safety
+# net for that one candidate is what's forfeited.
+MAX_CONCURRENT_DUCK_BACKSTOPS = 4
 
 
 class AudioBackpressureError(RuntimeError):
@@ -489,6 +496,9 @@ class ConversationSession:
         self._duck_last_growth_at = 0.0
 
     def _spawn_duck_backstop(self, *, generation_id: str, pcm: bytes) -> None:
+        if len(self._duck_backstop_tasks) >= MAX_CONCURRENT_DUCK_BACKSTOPS:
+            self._telemetry.duck_backstop_dropped_capacity += 1
+            return
         task = asyncio.create_task(self._run_duck_backstop(generation_id=generation_id, pcm=pcm))
         self._duck_backstop_tasks.add(task)
         task.add_done_callback(self._duck_backstop_tasks.discard)
@@ -530,9 +540,23 @@ class ConversationSession:
         # now, late, and let the turn through as it would have gone from the start.
         # The listener hears a dip, a resume, then a stop - rare, and accepted,
         # because the common case (an actual listening noise) pays nothing for it.
-        self._telemetry.duck_backstop_late_cancellations += 1
-        self._telemetry.possible_false_interruptions += 1
-        cancelled_generation_id = await self._cancel_generation(reason="user_speech", notify=True)
+        #
+        # But the STT round trip this waited on can outlive the generation it was
+        # worried about: that generation may since have finished normally, and a
+        # completely different one may be the one actually running now. Cancelling
+        # unconditionally would tear down whatever unrelated reply has since taken
+        # over, for a noise from turns ago - so only cancel if the generation this
+        # backstop was watching is still the one in flight. If it is not, there is
+        # nothing left to interrupt, but the words themselves are still real and
+        # still owed an answer: enqueue the turn uncancelled, and do not count a
+        # false interruption, since nothing was actually interrupted.
+        if self._generation_id == generation_id:
+            self._telemetry.duck_backstop_late_cancellations += 1
+            self._telemetry.possible_false_interruptions += 1
+            cancelled_generation_id = await self._cancel_generation(reason="user_speech", notify=True)
+        else:
+            self._telemetry.duck_backstop_stale_generation += 1
+            cancelled_generation_id = None
         self._enqueue_finalized(
             FinalizedAudio(
                 pcm=pcm,

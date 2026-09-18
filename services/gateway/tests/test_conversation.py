@@ -896,6 +896,102 @@ async def test_ducking_does_not_emit_a_listening_state_change() -> None:
     output.stop()
 
 
+class DelayedBackstopSpeech(FakeSpeech):
+    """The first transcription (the original turn) and the third (a later,
+    unrelated turn) resolve immediately. The second - the duck backstop's - blocks
+    until released, so a test can control exactly what has happened by the time
+    it decides anything."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.backstop_started = asyncio.Event()
+        self.release_backstop = asyncio.Event()
+
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        if self.transcriptions == 1:
+            return "Check the server."
+        if self.transcriptions == 2:
+            self.backstop_started.set()
+            await self.release_backstop.wait()
+            return "Actually check the logs too."
+        return "What is the weather?"
+
+
+async def test_duck_backstop_does_not_cancel_a_later_unrelated_generation() -> None:
+    """The backstop's STT round trip can outlive the generation it was worried
+    about. If that generation has already finished and a new, unrelated one has
+    since become audible, cancelling on the late "it was real speech" verdict
+    would stop the wrong reply for a noise from turns earlier. The words are
+    still real, though, so they must still reach the consumer - just without a
+    cancellation, and without counting a false interruption that never happened."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    speech = DelayedBackstopSpeech()
+    detector = SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),               # -> generation A
+        candidate(level_dbfs=-25, started=True, duration_ms=100),  # ducks A
+        candidate(level_dbfs=-25, duration_ms=100),                # no growth
+        finalized_candidate(level_dbfs=-25, duration_ms=100),      # spawns the backstop
+        TurnDetection(finalized_audio=bytes(6_400)),                # a fresh, unrelated turn -> generation B
+    ])
+    session = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=detector,  # type: ignore[arg-type]
+        sustained_speech_ms=10_000,
+        backchannel_gap_ms=20,
+    )
+    session.feed_audio(bytes(640))
+    speaking_a = await wait_for_event(events, "assistant.speaking")
+    generation_a = speaking_a["generation_id"]
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
+    await asyncio.sleep(0.05)  # let BACKCHANNEL_GAP_MS elapse in real time
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.unducked")
+    session.feed_audio(bytes(640))
+    await speech.backstop_started.wait()
+
+    done_a = await wait_for_event(events, "assistant.done")
+    assert done_a["generation_id"] == generation_a
+
+    # Generation A is fully finished before B is even asked for - the backstop
+    # for A's candidate is still blocked mid-transcription this whole time.
+    session.feed_audio(bytes(640))
+    async with asyncio.timeout(3):
+        while not any(
+            event == "assistant.speaking" and data["generation_id"] != generation_a
+            for event, data in events
+        ):
+            await asyncio.sleep(0.01)
+
+    # Only now, with an unrelated generation B audibly in progress, does the
+    # backstop's STT call get to finish and render its verdict.
+    speech.release_backstop.set()
+    async with asyncio.timeout(3):
+        while len(consumer.turns) < 3:
+            await asyncio.sleep(0.01)
+
+    await session.close()
+    output.stop()
+
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+    assert [turn.text for turn in consumer.turns] == [
+        "Check the server.",
+        "What is the weather?",
+        "Actually check the logs too.",
+    ]
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["duck_backstop_stale_generation"] == 1
+    assert summary["duck_backstop_late_cancellations"] == 0
+    assert summary["possible_false_interruptions"] == 0
+
+
 async def test_a_cancelled_reply_that_yields_no_speech_at_all_is_reported() -> None:
     """Fennec cannot resume audio it binned, so the consumer has to hear that its reply
     was stopped for nothing and decide whether to carry on. This only happens when the
