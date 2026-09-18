@@ -317,9 +317,13 @@ class ConversationSession:
                 # Assistant audio is actually reaching the speakers - duck rather
                 # than tear the generation down, and decide from how the
                 # candidate grows instead of cancelling on acoustic evidence alone.
-                self._begin_duck(detection=detection, confirmed_at=confirmed_at, level_dbfs=level_dbfs)
-                ducked = True
-            else:
+                # This can still fail: a duck backstop's own cancellation of that
+                # same generation can land concurrently and null generation_id
+                # between the echo window looking open and reaching here.
+                ducked = self._begin_duck(
+                    detection=detection, confirmed_at=confirmed_at, level_dbfs=level_dbfs
+                )
+            if not ducked and self._candidate_echo_generation_id is None:
                 # Nothing audible yet - the reply is still being generated or
                 # synthesized - so there is nothing to preserve by ducking.
                 if self._generation_id is not None:
@@ -330,6 +334,11 @@ class ConversationSession:
                     confirmed_at=confirmed_at,
                     level_dbfs=level_dbfs,
                 )
+            # If _candidate_echo_generation_id was set but the duck could not
+            # find a live generation to duck, whatever it would have watched is
+            # already being torn down by something else - there is nothing left
+            # here to cancel or preserve either. Falling through to the
+            # "not ducked" listening emit below is correct either way.
         elif (
             self._generation_task is not None
             and not self._generation_task.done()
@@ -338,7 +347,10 @@ class ConversationSession:
         if not ducked:
             # A duck leaves the assistant "speaking" - emitting "listening" here
             # would tell the client the reply had stopped when it is still audibly
-            # in progress, just quieter.
+            # in progress, just quieter. When nothing was ducked, the assistant
+            # really did stop (or never started audibly at all), and the client
+            # must be told so - this is what closes the gap that let a client
+            # believe playback continued when it had not.
             self._emit("state.changed", state="listening")
 
     def _begin_duck(
@@ -347,10 +359,15 @@ class ConversationSession:
         detection: TurnDetection,
         confirmed_at: float,
         level_dbfs: float,
-    ) -> None:
+    ) -> bool:
+        """Returns whether a duck actually began. It can fail to: a concurrent
+        duck backstop's own cancellation can null self._generation_id between
+        this candidate observing an open echo-risk window and reaching here.
+        Callers must not assume success - there being nothing to duck is exactly
+        the condition that requires falling back to the not-ducked state."""
         generation_id = self._generation_id
         if generation_id is None:
-            return
+            return False
         self._output.duck()
         self._duck_generation_id = generation_id
         self._duck_restored = False
@@ -358,6 +375,7 @@ class ConversationSession:
         self._duck_last_growth_at = confirmed_at
         self._telemetry.ducked_candidates += 1
         self._emit("assistant.ducked", generation_id=generation_id, level_dbfs=level_dbfs)
+        return True
 
     async def _evaluate_duck_shape(
         self,
@@ -387,14 +405,23 @@ class ConversationSession:
         *,
         observed_at: float,
     ) -> None:
+        generation_id = self._duck_generation_id
         self._duck_generation_id = None
         self._duck_restored = False
+        if generation_id is None or self._generation_id != generation_id:
+            # The generation this candidate was watching already ended, or was
+            # replaced by something else - most likely a duck backstop's own
+            # late cancel of that same generation, racing this same shape check.
+            # Whatever is current now is not this candidate's business: leave
+            # its gain and its generation alone, and let this candidate finalize
+            # into an ordinary turn instead of cancelling or restoring blind.
+            self._telemetry.duck_shape_stale_generation += 1
+            return
         self._telemetry.duck_confirmed_by_shape += 1
         self._output.restore()
-        if self._generation_id is not None:
-            # Purge before awaiting the cancellation: that await lets the turn
-            # worker resume and pull the stale echo turn out of the queue.
-            self._drop_unconfirmed_for_generation(self._generation_id)
+        # Purge before awaiting the cancellation: that await lets the turn
+        # worker resume and pull the stale echo turn out of the queue.
+        self._drop_unconfirmed_for_generation(self._generation_id)
         level_dbfs = max(detection.recent_speech_level_dbfs, detection.speech_level_dbfs)
         self._candidate_cancelled_generation_id = await self._cancel_generation(
             reason="user_speech",
