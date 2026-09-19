@@ -9,6 +9,7 @@ dependencies = [
   "fastapi==0.141.1",
   "faster-whisper==1.2.1",
   "httpx==0.28.1",
+  "numpy==2.5.2",
   "pyjwt==2.13.0",
   "uvicorn==0.52.3",
 ]
