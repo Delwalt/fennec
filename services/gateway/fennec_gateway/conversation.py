@@ -46,6 +46,22 @@ BACKCHANNEL_SOUNDS = frozenset(
     {"hm", "hmm", "hmmm", "mm", "mmm", "mhm", "mmhm", "mmhmm", "uhhuh", "huh",
      "uh", "um", "erm", "er", "ah", "aha", "oh"}
 )
+# Taking the floor from a reply that is still playing takes a sentence. Whatever
+# it opens with - an agreement or a refusal, "okay but how", "wait how about",
+# "no I think" - the words keep coming, and that is what marks it: a word followed
+# by more words inside the gap is an interruption. A word followed by nothing is a
+# nod, whatever the word turned out to be, which is also what makes it right for
+# whisper rendering a cough as "df".
+#
+# So only words that are a complete interruption standing alone need naming:
+# every one of these is a whole thing to say by itself, either an order to stop or
+# a request to hear that again. Words that merely tend to open an interruption
+# ("but", "actually", "so") are deliberately absent - alone they are a false
+# start, and the sentence they belong to is already more than one word.
+INTERRUPTION_WORDS = frozenset(
+    {"stop", "wait", "pause", "cancel", "no", "nope", "nah", "quiet", "listen",
+     "hush", "hey", "sorry", "what", "why", "repeat", "again", "enough"}
+)
 # Level and duration cannot tell "hmm" apart from "stop" - both arrive at
 # conversational loudness and last about as long. Shape can: taking the floor to
 # say something takes words, so real speech keeps growing past this many
@@ -578,6 +594,20 @@ class ConversationSession:
         # still owed an answer: enqueue the turn uncancelled, and do not count a
         # false interruption, since nothing was actually interrupted.
         if self._generation_id == generation_id:
+            if _is_acknowledgement(text):
+                # Fennec is provably still mid-sentence - this is the generation
+                # the burst ducked and it has not finished - so one word and then
+                # silence is the listener saying "go on", not a turn. The same
+                # word after the reply ended takes the branch below and is
+                # answered normally; that is the whole distinction, and
+                # _generation_id having been nulled on completion is what draws it.
+                self._telemetry.acknowledgement_turns += 1
+                self._emit(
+                    "turn.ignored",
+                    turn_id=secrets.token_urlsafe(12),
+                    reason="acknowledgement",
+                )
+                return
             self._telemetry.duck_backstop_late_cancellations += 1
             self._telemetry.possible_false_interruptions += 1
             cancelled_generation_id = await self._cancel_generation(reason="user_speech", notify=True)
@@ -1215,6 +1245,18 @@ def _is_backchannel(transcript: str) -> bool:
     "mmhmm", or "Mm hmm" depending on the phrase around it."""
     sounds = TOKEN_PATTERN.findall(transcript.casefold().replace("-", ""))
     return bool(sounds) and all(sound in BACKCHANNEL_SOUNDS for sound in sounds)
+
+
+def _is_acknowledgement(transcript: str) -> bool:
+    """Whether a lone word over a still-playing reply meant "go on" rather than
+    "stop". One word with nothing after it is the shape of an acknowledgement
+    whatever the word turns out to be, so this asks only that it is a single word
+    and not one of the few that stop a reply by themselves.
+
+    Callers must have established that the reply really is still in flight. Out of
+    that context the same word is an ordinary answer and belongs in a turn."""
+    words = TOKEN_PATTERN.findall(transcript.casefold().replace("-", ""))
+    return len(words) == 1 and words[0] not in INTERRUPTION_WORDS
 
 
 def _is_assistant_echo(transcript: str, assistant_text: str) -> bool:

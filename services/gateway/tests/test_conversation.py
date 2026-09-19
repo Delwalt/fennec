@@ -1403,3 +1403,199 @@ async def test_each_tenants_turns_go_only_to_that_tenants_consumer() -> None:
 
     await session.close()
     await runtime.close()
+
+
+class EndedReplyBackstopSpeech(FakeSpeech):
+    """The reply finishes normally while the backstop is still blocked in STT, so
+    by the time its verdict lands there is no generation left to say "go on" to."""
+
+    def __init__(self, interruption: str) -> None:
+        super().__init__()
+        self._interruption = interruption
+        self.backstop_started = asyncio.Event()
+        self.release_backstop = asyncio.Event()
+
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        if self.transcriptions == 1:
+            return "Check the server."
+        self.backstop_started.set()
+        await self.release_backstop.wait()
+        return self._interruption
+
+
+class LiveReplyBackstopSpeech(FakeSpeech):
+    """Generation A never finishes - its second phrase blocks forever in synthesis
+    - so A is provably still the generation in flight when the duck backstop
+    renders its verdict. The backstop's own transcription returns whatever the
+    burst was meant to have been."""
+
+    def __init__(self, interruption: str) -> None:
+        super().__init__()
+        self._interruption = interruption
+
+    async def transcribe(self, _: bytes) -> str:
+        self.transcriptions += 1
+        if self.transcriptions == 1:
+            return "Check the server."
+        return self._interruption
+
+    async def synthesize(self, text: str) -> bytes:
+        self.synthesized.append(text)
+        if len(self.synthesized) == 1:
+            return await super().synthesize(text)
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+
+async def _drive_short_burst(session, events) -> None:
+    """Duck a live reply with a burst that resolves as short by its shape, then
+    let the finalized candidate spawn the backstop."""
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.speaking")
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.ducked")
+    await asyncio.sleep(0.05)  # let BACKCHANNEL_GAP_MS elapse in real time
+    session.feed_audio(bytes(640))
+    await wait_for_event(events, "assistant.unducked")
+    session.feed_audio(bytes(640))
+
+
+def _short_burst_detector() -> "SequenceDetector":
+    return SequenceDetector([
+        TurnDetection(finalized_audio=bytes(6_400)),               # -> generation A
+        candidate(level_dbfs=-25, started=True, duration_ms=100),  # ducks A
+        candidate(level_dbfs=-25, duration_ms=100),                # no growth
+        finalized_candidate(level_dbfs=-25, duration_ms=100),      # spawns the backstop
+    ])
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Okay.",           # the common acknowledgement the word list never covered
+        "Gotcha",          # and one no list would have thought to include
+        "df",              # whisper's rendering of a cough or a bumped mic
+        "a",               # ditto, shorter
+    ],
+)
+async def test_a_lone_word_over_a_live_reply_is_not_a_turn(transcript: str) -> None:
+    """One word and then silence, while the reply is still audibly in flight, is
+    the listener acknowledging - or the recognizer inventing something out of a
+    cough. Either way the transcript backstop used to read it as real speech and
+    cancel late: a dip, a resume, then a stop. Nothing is cancelled now, and no
+    turn is raised."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    session = ConversationSession(
+        session_id="session",
+        speech=LiveReplyBackstopSpeech(transcript),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=_short_burst_detector(),  # type: ignore[arg-type]
+        sustained_speech_ms=10_000,
+        backchannel_gap_ms=20,
+    )
+    await _drive_short_burst(session, events)
+    ignored = await wait_for_event(events, "turn.ignored")
+    await session.close()
+    output.stop()
+
+    assert ignored["reason"] == "acknowledgement"
+    assert not any(event == "assistant.cancelled" for event, _ in events)
+    assert [turn.text for turn in consumer.turns] == ["Check the server."]
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["acknowledgement_turns"] == 1
+    assert summary["duck_backstop_late_cancellations"] == 0
+    assert summary["possible_false_interruptions"] == 0
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        # The three words that are a complete interruption standing alone.
+        "Stop.",
+        "Wait",
+        "No",
+        # And the general case: a word followed by more words, whatever it opens
+        # with. Nothing here is in INTERRUPTION_WORDS except by accident - the
+        # word count is what decides.
+        "Okay but how about",
+        "Cool but let's do the other one",
+        "Sounds good, how about we",
+    ],
+)
+async def test_speech_that_keeps_going_still_stops_the_reply(transcript: str) -> None:
+    """Two ways to be a real interruption: be one of the three words that take the
+    floor alone, or keep talking. Reading either as "go on" would leave Fennec
+    talking over someone who meant to stop it."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    session = ConversationSession(
+        session_id="session",
+        speech=LiveReplyBackstopSpeech(transcript),
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=_short_burst_detector(),  # type: ignore[arg-type]
+        sustained_speech_ms=10_000,
+        backchannel_gap_ms=20,
+    )
+    await _drive_short_burst(session, events)
+    await wait_for_event(events, "assistant.cancelled")
+    async with asyncio.timeout(3):
+        while len(consumer.turns) < 2:
+            await asyncio.sleep(0.01)
+    await session.close()
+    output.stop()
+
+    assert consumer.turns[1].text == transcript
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["acknowledgement_turns"] == 0
+    assert summary["duck_backstop_late_cancellations"] == 1
+
+
+async def test_the_same_lone_word_after_the_reply_ended_is_still_answered() -> None:
+    """The other half of the distinction: a word only means "go on" while there is
+    something to go on with. Once the reply has finished - Fennec may have just
+    asked a yes-or-no question - the identical word is the answer to it, and
+    dropping it would leave the caller talking to silence."""
+    events: list[tuple[str, dict]] = []
+    consumer = RecordingConsumer()
+    output = AssistantAudioTrack()
+    speech = EndedReplyBackstopSpeech("Okay.")
+    session = ConversationSession(
+        session_id="session",
+        speech=speech,
+        consumer=consumer,
+        output=output,
+        send_event=lambda event_type, data: events.append((event_type, data)),
+        detector=_short_burst_detector(),  # type: ignore[arg-type]
+        sustained_speech_ms=10_000,
+        backchannel_gap_ms=20,
+    )
+    await _drive_short_burst(session, events)
+    await speech.backstop_started.wait()
+
+    # The reply runs to completion while the backstop is still blocked in STT,
+    # so by the time it decides anything there is nothing left to say "go on" to.
+    await wait_for_event(events, "assistant.done")
+    speech.release_backstop.set()
+    async with asyncio.timeout(3):
+        while len(consumer.turns) < 2:
+            await asyncio.sleep(0.01)
+
+    await session.close()
+    output.stop()
+
+    assert consumer.turns[1].text == "Okay."
+    assert not any(
+        data.get("reason") == "acknowledgement"
+        for event, data in events
+        if event == "turn.ignored"
+    )
+    summary = [data for event, data in events if event == "telemetry.session.summary"][0]
+    assert summary["acknowledgement_turns"] == 0
