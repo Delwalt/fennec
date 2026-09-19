@@ -265,7 +265,8 @@ class WebRTCTransport implements VoiceTransport {
     peer.addEventListener('connectionstatechange', () => {
       this.connectionState = mapConnectionState(peer.connectionState);
       if (peer.connectionState === 'failed') {
-        this.error = 'The direct WebRTC connection failed.';
+        // Keep the gateway's own reason if it sent one before the peer went down.
+        this.error ??= 'The direct WebRTC connection failed.';
         this.voiceState = 'failed';
       }
       this.emit();

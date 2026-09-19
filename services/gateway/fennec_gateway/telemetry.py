@@ -44,6 +44,7 @@ class SessionTelemetry:
         self.duck_backstop_stale_generation = 0
         self.duck_backstop_dropped_capacity = 0
         self.duck_shape_stale_generation = 0
+        self.dropped_input_frames = 0
 
     def timing(self, name: str, milliseconds: float) -> None:
         self._samples[name].append(max(0.0, milliseconds))
@@ -91,6 +92,7 @@ class SessionTelemetry:
             "duck_backstop_stale_generation": self.duck_backstop_stale_generation,
             "duck_backstop_dropped_capacity": self.duck_backstop_dropped_capacity,
             "duck_shape_stale_generation": self.duck_shape_stale_generation,
+            "dropped_input_frames": self.dropped_input_frames,
             "output_queue_peak_frames": output_queue_peak_frames,
             "stale_audio_frames_rejected": stale_audio_frames_rejected,
             "latency_ms": {
