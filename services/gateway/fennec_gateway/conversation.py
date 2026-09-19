@@ -46,6 +46,40 @@ BACKCHANNEL_SOUNDS = frozenset(
     {"hm", "hmm", "hmmm", "mm", "mmm", "mhm", "mmhm", "mmhmm", "uhhuh", "huh",
      "uh", "um", "erm", "er", "ah", "aha", "oh"}
 )
+# Taking the floor from a reply that is still playing takes a sentence. Whatever
+# it opens with - an agreement or a refusal, "okay but how", "wait how about",
+# "no I think" - the words keep coming, and that is what marks it: a word followed
+# by more words inside the gap is an interruption. A word followed by nothing is a
+# nod, whatever the word turned out to be, which is also what makes it right for
+# whisper rendering a cough as "df".
+#
+# So only words that are a complete interruption standing alone need naming:
+# every one of these is a whole thing to say by itself, either an order to stop or
+# a request to hear that again. Words that merely tend to open an interruption
+# ("but", "actually", "so") are deliberately absent - alone they are a false
+# start, and the sentence they belong to is already more than one word.
+INTERRUPTION_WORDS = frozenset(
+    {"stop", "wait", "pause", "cancel", "no", "nope", "nah", "quiet", "listen",
+     "hush", "hey", "sorry", "what", "why", "repeat", "again", "enough"}
+)
+# Level and duration cannot tell "hmm" apart from "stop" - both arrive at
+# conversational loudness and last about as long. Shape can: taking the floor to
+# say something takes words, so real speech keeps growing past this many
+# milliseconds of confirmed speech, and a burst that stops growing before then
+# never was more than a listening noise.
+SUSTAINED_SPEECH_MS = 750.0
+# How long a candidate can sit without growing before its silence counts as the
+# end of a short burst, rather than a breath mid-word. Deliberately shorter than
+# the endpoint silence that closes out a normal turn - this only decides whether
+# to keep ducking, not whether the turn itself is finished.
+BACKCHANNEL_GAP_MS = 500.0
+# Every short burst pays for a background STT call while its backstop runs.
+# Nodding through a long reply must not let those stack up unbounded; past this
+# many concurrent backstops, a new one is skipped rather than queued; the
+# candidate it would have watched already had its volume restored optimistically,
+# so the listener notices nothing either way, and the rare late-cancel safety
+# net for that one candidate is what's forfeited.
+MAX_CONCURRENT_DUCK_BACKSTOPS = 4
 
 
 class AudioBackpressureError(RuntimeError):
@@ -61,6 +95,7 @@ class FinalizedAudio:
     confirmed: bool = True
     echo_generation_id: str | None = None
     cancelled_generation_id: str | None = None
+    transcript: str | None = None
 
 
 class ConversationSession:
@@ -78,6 +113,8 @@ class ConversationSession:
         phrase_delay_seconds: float = 0.4,
         max_continuation_characters: int = 8_192,
         configuration: VoiceConfiguration | None = None,
+        sustained_speech_ms: float = SUSTAINED_SPEECH_MS,
+        backchannel_gap_ms: float = BACKCHANNEL_GAP_MS,
     ) -> None:
         if turn_queue_size < 1:
             raise ValueError("turn_queue_size must be at least one")
@@ -94,6 +131,8 @@ class ConversationSession:
         self._phrase_delay_seconds = phrase_delay_seconds
         self._max_continuation_characters = max_continuation_characters
         self._configuration = configuration
+        self._sustained_speech_ms = sustained_speech_ms
+        self._backchannel_gap_ms = backchannel_gap_ms
         self._audio_worker = asyncio.create_task(self._run_audio_worker())
         self._turn_worker = asyncio.create_task(self._run_turn_worker())
         self._generation_task: asyncio.Task[None] | None = None
@@ -108,6 +147,11 @@ class ConversationSession:
         self._candidate_confirmed = False
         self._candidate_echo_generation_id: str | None = None
         self._candidate_cancelled_generation_id: str | None = None
+        self._duck_generation_id: str | None = None
+        self._duck_restored = False
+        self._duck_speech_ms = 0.0
+        self._duck_last_growth_at = 0.0
+        self._duck_backstop_tasks: set[asyncio.Task[None]] = set()
         self._continuations_requested = 0
         self._continued_text: list[str] = []
         self._telemetry = SessionTelemetry()
@@ -135,6 +179,10 @@ class ConversationSession:
             return_exceptions=True,
         )
         await self._cancel_generation(reason="session_closed", notify=False)
+        for task in list(self._duck_backstop_tasks):
+            task.cancel()
+        if self._duck_backstop_tasks:
+            await asyncio.gather(*self._duck_backstop_tasks, return_exceptions=True)
         self._detector.reset()
         self._reset_candidate_state()
         self._echo_text.clear()
@@ -168,19 +216,38 @@ class ConversationSession:
                 await self._apply_candidate_evidence(detection, observed_at=observed_at)
                 if detection.finalized_audio is not None:
                     tracked_candidate = self._candidate_started_at is not None
-                    finalized = FinalizedAudio(
-                        pcm=detection.finalized_audio,
-                        forced_by_limit=detection.forced_by_limit,
-                        speech_end_delay_ms=detection.speech_end_delay_ms,
-                        detected_at=monotonic(),
-                        # Scripted adapters and older detector fakes can finalize a complete
-                        # turn without first reporting its candidate transition.
-                        confirmed=self._candidate_confirmed or not tracked_candidate,
-                        echo_generation_id=self._candidate_echo_generation_id,
-                        cancelled_generation_id=self._candidate_cancelled_generation_id,
-                    )
-                    self._reset_candidate_state()
-                    self._enqueue_finalized(finalized)
+                    duck_generation_id = self._duck_generation_id
+                    if duck_generation_id is not None and not self._duck_restored:
+                        # Silero's own endpoint closed the turn before the shape
+                        # check ever resolved it. Restore optimistically and let
+                        # the backstop decide, the same as a short burst would.
+                        self._output.restore()
+                        self._emit(
+                            "assistant.unducked",
+                            generation_id=duck_generation_id,
+                            reason="endpoint_reached",
+                        )
+                        self._telemetry.duck_restored_by_shape += 1
+                    if duck_generation_id is not None:
+                        self._reset_candidate_state()
+                        self._spawn_duck_backstop(
+                            generation_id=duck_generation_id,
+                            pcm=detection.finalized_audio,
+                        )
+                    else:
+                        finalized = FinalizedAudio(
+                            pcm=detection.finalized_audio,
+                            forced_by_limit=detection.forced_by_limit,
+                            speech_end_delay_ms=detection.speech_end_delay_ms,
+                            detected_at=monotonic(),
+                            # Scripted adapters and older detector fakes can finalize a complete
+                            # turn without first reporting its candidate transition.
+                            confirmed=self._candidate_confirmed or not tracked_candidate,
+                            echo_generation_id=self._candidate_echo_generation_id,
+                            cancelled_generation_id=self._candidate_cancelled_generation_id,
+                        )
+                        self._reset_candidate_state()
+                        self._enqueue_finalized(finalized)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -207,7 +274,16 @@ class ConversationSession:
             if self._candidate_echo_generation_id is not None:
                 self._telemetry.echo_candidates_deferred += 1
 
-        if self._candidate_started_at is None or self._candidate_confirmed:
+        if self._candidate_started_at is None:
+            return
+
+        if self._duck_generation_id is not None and not self._duck_restored:
+            # Runs on every tick, including ones after confirmation - the shape
+            # decision is made from how the candidate grows over time, not at the
+            # moment it is confirmed.
+            await self._evaluate_duck_shape(detection, observed_at=observed_at)
+
+        if self._candidate_confirmed:
             return
         if self._candidate_echo_generation_id is None:
             await self._confirm_candidate(detection, confirmed_at=observed_at)
@@ -251,23 +327,132 @@ class ConversationSession:
             noise_floor_dbfs=noise_floor_dbfs,
             confirmation_ms=round(confirmation_ms, 1),
         )
+        ducked = False
         if self._assistant_active:
-            # Purge before awaiting the cancellation: that await lets the turn
-            # worker resume and pull the stale echo turn out of the queue.
-            if self._generation_id is not None:
-                self._drop_unconfirmed_for_generation(self._generation_id)
-            self._candidate_cancelled_generation_id = await self._cancel_generation(
-                reason="user_speech",
-                notify=True,
-                confirmed_at=confirmed_at,
-                level_dbfs=level_dbfs,
-            )
+            if self._candidate_echo_generation_id is not None:
+                # Assistant audio is actually reaching the speakers - duck rather
+                # than tear the generation down, and decide from how the
+                # candidate grows instead of cancelling on acoustic evidence alone.
+                # This can still fail: a duck backstop's own cancellation of that
+                # same generation can land concurrently and null generation_id
+                # between the echo window looking open and reaching here.
+                ducked = self._begin_duck(
+                    detection=detection, confirmed_at=confirmed_at, level_dbfs=level_dbfs
+                )
+            if not ducked and self._candidate_echo_generation_id is None:
+                # Nothing audible yet - the reply is still being generated or
+                # synthesized - so there is nothing to preserve by ducking.
+                if self._generation_id is not None:
+                    self._drop_unconfirmed_for_generation(self._generation_id)
+                self._candidate_cancelled_generation_id = await self._cancel_generation(
+                    reason="user_speech",
+                    notify=True,
+                    confirmed_at=confirmed_at,
+                    level_dbfs=level_dbfs,
+                )
+            # If _candidate_echo_generation_id was set but the duck could not
+            # find a live generation to duck, whatever it would have watched is
+            # already being torn down by something else - there is nothing left
+            # here to cancel or preserve either. Falling through to the
+            # "not ducked" listening emit below is correct either way.
         elif (
             self._generation_task is not None
             and not self._generation_task.done()
         ) or not self._turn_queue.empty():
             self._continuations_requested += 1
+        if not ducked:
+            # A duck leaves the assistant "speaking" - emitting "listening" here
+            # would tell the client the reply had stopped when it is still audibly
+            # in progress, just quieter. When nothing was ducked, the assistant
+            # really did stop (or never started audibly at all), and the client
+            # must be told so - this is what closes the gap that let a client
+            # believe playback continued when it had not.
+            self._emit("state.changed", state="listening")
+
+    def _begin_duck(
+        self,
+        *,
+        detection: TurnDetection,
+        confirmed_at: float,
+        level_dbfs: float,
+    ) -> bool:
+        """Returns whether a duck actually began. It can fail to: a concurrent
+        duck backstop's own cancellation can null self._generation_id between
+        this candidate observing an open echo-risk window and reaching here.
+        Callers must not assume success - there being nothing to duck is exactly
+        the condition that requires falling back to the not-ducked state."""
+        generation_id = self._generation_id
+        if generation_id is None:
+            return False
+        self._output.duck()
+        self._duck_generation_id = generation_id
+        self._duck_restored = False
+        self._duck_speech_ms = detection.speech_duration_ms
+        self._duck_last_growth_at = confirmed_at
+        self._telemetry.ducked_candidates += 1
+        self._emit("assistant.ducked", generation_id=generation_id, level_dbfs=level_dbfs)
+        return True
+
+    async def _evaluate_duck_shape(
+        self,
+        detection: TurnDetection,
+        *,
+        observed_at: float,
+    ) -> None:
+        """Tell a listening noise from a real interruption by how the candidate
+        grows, not by what it says. Real speech keeps growing past
+        SUSTAINED_SPEECH_MS; a burst that stops growing for BACKCHANNEL_GAP_MS was
+        short and is done. Neither check needs a transcript."""
+        if not detection.candidate_evaluated:
+            return
+        if detection.speech_duration_ms > self._duck_speech_ms:
+            self._duck_speech_ms = detection.speech_duration_ms
+            self._duck_last_growth_at = observed_at
+        if self._duck_speech_ms >= self._sustained_speech_ms:
+            await self._resolve_duck_as_interruption(detection, observed_at=observed_at)
+            return
+        elapsed_ms = (observed_at - self._duck_last_growth_at) * 1_000
+        if elapsed_ms >= self._backchannel_gap_ms:
+            self._resolve_duck_as_backchannel_shaped()
+
+    async def _resolve_duck_as_interruption(
+        self,
+        detection: TurnDetection,
+        *,
+        observed_at: float,
+    ) -> None:
+        generation_id = self._duck_generation_id
+        self._duck_generation_id = None
+        self._duck_restored = False
+        if generation_id is None or self._generation_id != generation_id:
+            # The generation this candidate was watching already ended, or was
+            # replaced by something else - most likely a duck backstop's own
+            # late cancel of that same generation, racing this same shape check.
+            # Whatever is current now is not this candidate's business: leave
+            # its gain and its generation alone, and let this candidate finalize
+            # into an ordinary turn instead of cancelling or restoring blind.
+            self._telemetry.duck_shape_stale_generation += 1
+            return
+        self._telemetry.duck_confirmed_by_shape += 1
+        self._output.restore()
+        # Purge before awaiting the cancellation: that await lets the turn
+        # worker resume and pull the stale echo turn out of the queue.
+        self._drop_unconfirmed_for_generation(self._generation_id)
+        level_dbfs = max(detection.recent_speech_level_dbfs, detection.speech_level_dbfs)
+        self._candidate_cancelled_generation_id = await self._cancel_generation(
+            reason="user_speech",
+            notify=True,
+            confirmed_at=observed_at,
+            level_dbfs=level_dbfs,
+        )
         self._emit("state.changed", state="listening")
+
+    def _resolve_duck_as_backchannel_shaped(self) -> None:
+        generation_id = self._duck_generation_id
+        self._duck_restored = True
+        self._output.restore()
+        self._telemetry.duck_restored_by_shape += 1
+        self._emit("assistant.unducked", generation_id=generation_id, reason="short_burst")
 
     def _observe_noise_floor(self, pcm: bytes, *, candidate_active: bool) -> None:
         if candidate_active or self._active_echo_generation() is not None:
@@ -319,6 +504,20 @@ class ConversationSession:
         self._telemetry.dropped_unconfirmed_generation_cancelled += dropped
 
     def _abandon_candidate(self) -> None:
+        if self._duck_generation_id is not None:
+            # A ducked candidate evaporated before the shape check ever resolved
+            # it. Nothing was cancelled, so there is nothing to report - just
+            # give the reply its volume back.
+            if not self._duck_restored:
+                self._output.restore()
+                self._emit(
+                    "assistant.unducked",
+                    generation_id=self._duck_generation_id,
+                    reason="abandoned",
+                )
+                self._telemetry.duck_restored_by_shape += 1
+            self._reset_candidate_state()
+            return
         cancelled = self._candidate_cancelled_generation_id
         if cancelled is not None:
             # A reply was stopped for speech that turned out to be nothing at all.
@@ -334,6 +533,98 @@ class ConversationSession:
         self._candidate_confirmed = False
         self._candidate_echo_generation_id = None
         self._candidate_cancelled_generation_id = None
+        self._duck_generation_id = None
+        self._duck_restored = False
+        self._duck_speech_ms = 0.0
+        self._duck_last_growth_at = 0.0
+
+    def _spawn_duck_backstop(self, *, generation_id: str, pcm: bytes) -> None:
+        if len(self._duck_backstop_tasks) >= MAX_CONCURRENT_DUCK_BACKSTOPS:
+            self._telemetry.duck_backstop_dropped_capacity += 1
+            return
+        task = asyncio.create_task(self._run_duck_backstop(generation_id=generation_id, pcm=pcm))
+        self._duck_backstop_tasks.add(task)
+        task.add_done_callback(self._duck_backstop_tasks.discard)
+
+    async def _run_duck_backstop(self, *, generation_id: str, pcm: bytes) -> None:
+        """The shape check already let the reply keep going; this exists only to
+        catch the rare case where a short, isolated burst turns out to have been a
+        real word. Transcribing and deciding here, off the turn queue, is what
+        lets it act on a generation the turn worker never touched - the turn
+        worker is still busy with (or already past) that same generation, so a
+        classification made inside _run_turn would never get to run until it was
+        too late to matter."""
+        try:
+            if self._configuration is None:
+                text = await self._speech.transcribe(pcm)
+            else:
+                text = await self._speech.transcribe(
+                    pcm,
+                    model=self._configuration.stt_model,
+                    language=self._configuration.speech_language,
+                    vocabulary=self._configuration.speech_vocabulary,
+                )
+        except ProviderError:
+            self._telemetry.provider_errors += 1
+            return
+        if not text.strip():
+            self._emit("turn.ignored", turn_id=secrets.token_urlsafe(12), reason="empty_transcript")
+            return
+        if _is_backchannel(text):
+            self._telemetry.backchannel_turns += 1
+            self._emit("turn.ignored", turn_id=secrets.token_urlsafe(12), reason="backchannel")
+            return
+        assistant_text = self._echo_text.get(generation_id)
+        if assistant_text is not None and _is_assistant_echo(text, assistant_text):
+            self._telemetry.assistant_echo_turns += 1
+            self._emit("turn.ignored", turn_id=secrets.token_urlsafe(12), reason="assistant_echo")
+            return
+        # Real speech under a reply Fennec had already let keep playing: cancel it
+        # now, late, and let the turn through as it would have gone from the start.
+        # The listener hears a dip, a resume, then a stop - rare, and accepted,
+        # because the common case (an actual listening noise) pays nothing for it.
+        #
+        # But the STT round trip this waited on can outlive the generation it was
+        # worried about: that generation may since have finished normally, and a
+        # completely different one may be the one actually running now. Cancelling
+        # unconditionally would tear down whatever unrelated reply has since taken
+        # over, for a noise from turns ago - so only cancel if the generation this
+        # backstop was watching is still the one in flight. If it is not, there is
+        # nothing left to interrupt, but the words themselves are still real and
+        # still owed an answer: enqueue the turn uncancelled, and do not count a
+        # false interruption, since nothing was actually interrupted.
+        if self._generation_id == generation_id:
+            if _is_acknowledgement(text):
+                # Fennec is provably still mid-sentence - this is the generation
+                # the burst ducked and it has not finished - so one word and then
+                # silence is the listener saying "go on", not a turn. The same
+                # word after the reply ended takes the branch below and is
+                # answered normally; that is the whole distinction, and
+                # _generation_id having been nulled on completion is what draws it.
+                self._telemetry.acknowledgement_turns += 1
+                self._emit(
+                    "turn.ignored",
+                    turn_id=secrets.token_urlsafe(12),
+                    reason="acknowledgement",
+                )
+                return
+            self._telemetry.duck_backstop_late_cancellations += 1
+            self._telemetry.possible_false_interruptions += 1
+            cancelled_generation_id = await self._cancel_generation(reason="user_speech", notify=True)
+        else:
+            self._telemetry.duck_backstop_stale_generation += 1
+            cancelled_generation_id = None
+        self._enqueue_finalized(
+            FinalizedAudio(
+                pcm=pcm,
+                forced_by_limit=False,
+                speech_end_delay_ms=0.0,
+                detected_at=monotonic(),
+                confirmed=True,
+                cancelled_generation_id=cancelled_generation_id,
+                transcript=text,
+            )
+        )
 
     async def _run_turn_worker(self) -> None:
         try:
@@ -379,7 +670,12 @@ class ConversationSession:
 
         try:
             stt_started_at = monotonic()
-            if self._configuration is None:
+            if finalized.transcript is not None:
+                # The duck backstop already transcribed this candidate to decide
+                # whether to cancel late; transcribing it again would pay for the
+                # same STT call twice.
+                text = finalized.transcript
+            elif self._configuration is None:
                 text = await self._speech.transcribe(pcm)
             else:
                 text = await self._speech.transcribe(
@@ -949,6 +1245,18 @@ def _is_backchannel(transcript: str) -> bool:
     "mmhmm", or "Mm hmm" depending on the phrase around it."""
     sounds = TOKEN_PATTERN.findall(transcript.casefold().replace("-", ""))
     return bool(sounds) and all(sound in BACKCHANNEL_SOUNDS for sound in sounds)
+
+
+def _is_acknowledgement(transcript: str) -> bool:
+    """Whether a lone word over a still-playing reply meant "go on" rather than
+    "stop". One word with nothing after it is the shape of an acknowledgement
+    whatever the word turns out to be, so this asks only that it is a single word
+    and not one of the few that stop a reply by themselves.
+
+    Callers must have established that the reply really is still in flight. Out of
+    that context the same word is an ordinary answer and belongs in a turn."""
+    words = TOKEN_PATTERN.findall(transcript.casefold().replace("-", ""))
+    return len(words) == 1 and words[0] not in INTERRUPTION_WORDS
 
 
 def _is_assistant_echo(transcript: str, assistant_text: str) -> bool:

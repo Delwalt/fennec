@@ -8,12 +8,26 @@ import math
 
 from aiortc import MediaStreamTrack
 from av import AudioFrame
+import numpy as np
 
 
 @dataclass(frozen=True, slots=True)
 class PlaybackFrame:
     generation_id: str
     pcm: bytes
+
+
+# A duck has to stay legible: the shape check that decides whether to undo it can
+# leave the assistant quietly talking for the better part of a second, unlike a
+# hard cancel, so the dip cannot swallow the sentence the way a hard mute could.
+DUCK_GAIN_DB = -9.0
+# Long enough that a linear step doesn't zipper, short enough that the dip still
+# reads as an immediate reaction to the first sound the user made.
+GAIN_RAMP_MS = 30.0
+
+
+def _linear_gain(decibels: float) -> float:
+    return 10 ** (decibels / 20)
 
 
 class AssistantAudioTrack(MediaStreamTrack):
@@ -32,6 +46,9 @@ class AssistantAudioTrack(MediaStreamTrack):
         self._queue: asyncio.Queue[PlaybackFrame] = asyncio.Queue(maxsize=queue_frames)
         self._queued_peak = 0
         self._rejected_frames = 0
+        self._gain = 1.0
+        self._gain_target = 1.0
+        self._gain_step = 0.0
 
     def trigger(self, *, duration_seconds: float = 0.45) -> None:
         loop = asyncio.get_running_loop()
@@ -57,11 +74,35 @@ class AssistantAudioTrack(MediaStreamTrack):
     def begin_generation(self, generation_id: str) -> None:
         self._active_generation = generation_id
         self._clear_queue()
+        # A fresh generation starts undamped regardless of what happened to the
+        # last one - relying on every caller to remember to restore() first would
+        # leave a stale duck bleeding into a reply that never asked for it.
+        self._gain = 1.0
+        self._gain_target = 1.0
+        self._gain_step = 0.0
 
     def cancel_generation(self, generation_id: str) -> None:
         if generation_id == self._active_generation:
             self._active_generation = None
             self._clear_queue()
+
+    @property
+    def gain(self) -> float:
+        """Current output gain, linear (1.0 = unity). For tests and telemetry."""
+        return self._gain
+
+    def duck(self) -> None:
+        self._set_gain_target(_linear_gain(DUCK_GAIN_DB))
+
+    def restore(self) -> None:
+        self._set_gain_target(1.0)
+
+    def _set_gain_target(self, target: float) -> None:
+        if target == self._gain_target:
+            return
+        self._gain_target = target
+        ramp_samples = max(1, int(self.sample_rate * GAIN_RAMP_MS / 1_000))
+        self._gain_step = abs(target - self._gain) / ramp_samples
 
     async def enqueue_pcm(self, *, generation_id: str, pcm: bytes) -> bool:
         if generation_id != self._active_generation:
@@ -94,7 +135,7 @@ class AssistantAudioTrack(MediaStreamTrack):
         if delay > 0:
             await asyncio.sleep(delay)
 
-        pcm = self._next_pcm(loop.time())
+        pcm = self._apply_gain(self._next_pcm(loop.time()))
 
         frame = AudioFrame(format="s16", layout="mono", samples=self.samples_per_frame)
         frame.planes[0].update(pcm)
@@ -122,3 +163,22 @@ class AssistantAudioTrack(MediaStreamTrack):
             if playback.generation_id == self._active_generation:
                 return playback.pcm
             self._rejected_frames += 1
+
+    def _apply_gain(self, pcm: bytes) -> bytes:
+        if self._gain == 1.0 and self._gain_target == 1.0:
+            return pcm
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float64)
+        if self._gain == self._gain_target:
+            scaled = samples * self._gain
+        else:
+            direction = 1.0 if self._gain_target > self._gain else -1.0
+            offsets = direction * self._gain_step * np.arange(1, len(samples) + 1)
+            gains = self._gain + offsets
+            if direction > 0:
+                np.minimum(gains, self._gain_target, out=gains)
+            else:
+                np.maximum(gains, self._gain_target, out=gains)
+            scaled = samples * gains
+            self._gain = float(gains[-1])
+        clipped = np.clip(scaled, -32_768, 32_767).astype("<i2")
+        return clipped.tobytes()
