@@ -63,11 +63,11 @@ INTERRUPTION_WORDS = frozenset(
      "hush", "hey", "sorry", "what", "why", "repeat", "again", "enough"}
 )
 # Level and duration cannot tell "hmm" apart from "stop" - both arrive at
-# conversational loudness and last about as long. Shape can: taking the floor to
-# say something takes words, so real speech keeps growing past this many
-# milliseconds of confirmed speech, and a burst that stops growing before then
-# never was more than a listening noise.
-SUSTAINED_SPEECH_MS = 750.0
+# conversational loudness and last about as long. Shape can: a nod is one word
+# and then silence, so speech still growing this late is a sentence. Measured
+# rather than guessed - a spoken "okay" runs 750-950 ms here, and a threshold
+# anywhere near that cancels the nods this exists to protect.
+SUSTAINED_SPEECH_MS = 1500.0
 # How long a candidate can sit without growing before its silence counts as the
 # end of a short burst, rather than a breath mid-word. Deliberately shorter than
 # the endpoint silence that closes out a normal turn - this only decides whether
